@@ -12,8 +12,9 @@
 //! reference interpreter of those buffers used to validate the encoding and pin
 //! the exact opcode semantics before they are transliterated into WGSL.
 //!
-//! v1 scope: signals up to 32 bits (one limb), no memories, no resets, no
-//! `Concat`/`MemRead`. Anything else is rejected by `encode`.
+//! Scope: signals and memory data up to 32 bits (one limb), no resets, no
+//! `Concat`. Anything else is rejected by `encode`. Memories (RAM / register
+//! files) are supported.
 
 use rrtl_ir::{Diagnostic, ErrorReport};
 use rrtl_sim_ir::{
@@ -54,6 +55,10 @@ pub const OP_MEM_WRITE: u32 = 22;
 
 /// Words per encoded record: `[op, dst_or_offset, width, a, b, c]`.
 pub const RECORD_WORDS: usize = 6;
+
+/// Default compute workgroup size for the interpreter kernel. Larger groups
+/// (256) measured ~32% faster than 64 on Apple GPU for this memory-bound kernel.
+pub const INTERP_DEFAULT_WORKGROUP: u32 = 256;
 
 /// Streams, indexed `[async_reset_comb, comb, tick_next, tick_commit]`.
 #[derive(Clone, Copy, Debug)]
@@ -575,6 +580,7 @@ pub struct InterpGpuSimulator {
     lanes: usize,
     total_signal_words: usize,
     total_memory_words: usize,
+    workgroup_size: u32,
 }
 
 fn storage_words(words: usize) -> u64 {
@@ -583,10 +589,23 @@ fn storage_words(words: usize) -> u64 {
 
 impl InterpGpuSimulator {
     pub fn new(program: &InterpProgram, lanes: usize) -> Result<Self, ErrorReport> {
-        pollster::block_on(Self::new_async(program, lanes))
+        Self::new_with_workgroup(program, lanes, INTERP_DEFAULT_WORKGROUP)
     }
 
-    async fn new_async(program: &InterpProgram, lanes: usize) -> Result<Self, ErrorReport> {
+    /// Builds with an explicit compute workgroup size (threads per group).
+    pub fn new_with_workgroup(
+        program: &InterpProgram,
+        lanes: usize,
+        workgroup_size: u32,
+    ) -> Result<Self, ErrorReport> {
+        pollster::block_on(Self::new_async(program, lanes, workgroup_size))
+    }
+
+    async fn new_async(
+        program: &InterpProgram,
+        lanes: usize,
+        workgroup_size: u32,
+    ) -> Result<Self, ErrorReport> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -707,7 +726,7 @@ impl InterpGpuSimulator {
             ],
         });
 
-        let source = INTERP_WGSL.replace("{WG}", &crate::WORKGROUP_SIZE.to_string());
+        let source = INTERP_WGSL.replace("{WG}", &workgroup_size.to_string());
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interp-kernel"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -736,6 +755,7 @@ impl InterpGpuSimulator {
             lanes,
             total_signal_words: program.total_signal_words,
             total_memory_words: program.total_memory_words,
+            workgroup_size,
         })
     }
 
@@ -778,7 +798,7 @@ impl InterpGpuSimulator {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            let groups = (self.lanes as u32).div_ceil(crate::WORKGROUP_SIZE);
+            let groups = (self.lanes as u32).div_ceil(self.workgroup_size);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));

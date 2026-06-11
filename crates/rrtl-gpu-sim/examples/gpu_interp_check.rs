@@ -35,7 +35,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let p = |i: usize, d: usize| args.get(i).and_then(|a| a.parse().ok()).unwrap_or(d);
     let (width, depth, lanes, steps) = (p(1, 8), p(2, 4), p(3, 1024), p(4, 64));
-    println!("Wide width={width} depth={depth} lanes={lanes} steps={steps}");
+    let wg = p(5, 64) as u32;
+    println!("Wide width={width} depth={depth} lanes={lanes} steps={steps} wg={wg}");
 
     let design = build_wide(width, depth);
     let compiled = compile(&design).unwrap();
@@ -63,7 +64,7 @@ fn main() {
     println!("encoded code: {} bytes ({} signals)", words * 4, program.signals.len());
 
     eprintln!("GPU construct ...");
-    let gpu = InterpGpuSimulator::new(&encoded, lanes).unwrap();
+    let gpu = InterpGpuSimulator::new_with_workgroup(&encoded, lanes, wg).unwrap();
     gpu.set_signal(off(clk), &vec![1u32; lanes]);
     gpu.set_signal(off(din), &din_u32);
     eprintln!("GPU tick_many ...");
