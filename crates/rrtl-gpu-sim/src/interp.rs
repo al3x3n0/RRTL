@@ -378,6 +378,335 @@ impl InterpRunner {
     }
 }
 
+/// Fixed-size WGSL interpreter kernel. The design is uploaded as data (the
+/// `code` buffer), so this shader never changes with design size — one thread
+/// per lane, all lanes running the identical instruction stream (uniform PC,
+/// zero divergence). Transliterates [`InterpRunner`]. `{WG}` is the workgroup size.
+const INTERP_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read_write> sig: array<u32>;
+@group(0) @binding(1) var<storage, read_write> reg_next: array<u32>;
+@group(0) @binding(2) var<storage, read_write> values: array<u32>;
+@group(0) @binding(3) var<storage, read> code: array<u32>;
+@group(0) @binding(4) var<storage, read> captured: array<u32>;
+@group(0) @binding(5) var<storage, read> params: array<u32>;
+
+fn mask_of(width: u32) -> u32 {
+  if (width == 0u) { return 0u; }
+  if (width >= 32u) { return 0xffffffffu; }
+  return (1u << width) - 1u;
+}
+
+fn vget(id: u32, lanes: u32, lane: u32) -> u32 { return values[id * lanes + lane]; }
+
+fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
+  var r = begin;
+  loop {
+    if (r >= end) { break; }
+    let base = r * 6u;
+    let op = code[base];
+    let f1 = code[base + 1u];
+    let width = code[base + 2u];
+    let a = code[base + 3u];
+    let b = code[base + 4u];
+    let c = code[base + 5u];
+    let mask = mask_of(width);
+    var res = 0u;
+    var is_effect = false;
+    switch op {
+      case 0u: { res = a & mask; }
+      case 1u: { res = sig[a * lanes + lane] & mask; }
+      case 2u: { res = (~vget(a, lanes, lane)) & mask; }
+      case 3u: { res = (vget(a, lanes, lane) & vget(b, lanes, lane)) & mask; }
+      case 4u: { res = (vget(a, lanes, lane) | vget(b, lanes, lane)) & mask; }
+      case 5u: { res = (vget(a, lanes, lane) ^ vget(b, lanes, lane)) & mask; }
+      case 6u: { res = (vget(a, lanes, lane) + vget(b, lanes, lane)) & mask; }
+      case 7u: { res = (vget(a, lanes, lane) - vget(b, lanes, lane)) & mask; }
+      case 8u: { res = (vget(a, lanes, lane) * vget(b, lanes, lane)) & mask; }
+      case 9u: { res = select(0u, 1u, vget(a, lanes, lane) == vget(b, lanes, lane)); }
+      case 10u: { res = select(0u, 1u, vget(a, lanes, lane) != vget(b, lanes, lane)); }
+      case 11u: { res = select(0u, 1u, vget(a, lanes, lane) < vget(b, lanes, lane)); }
+      case 12u: {
+        let sign = 1u << (c - 1u);
+        let l = vget(a, lanes, lane);
+        let rr = vget(b, lanes, lane);
+        let ls = (l & sign) != 0u;
+        let rs = (rr & sign) != 0u;
+        if (ls != rs) { res = select(0u, 1u, ls); } else { res = select(0u, 1u, l < rr); }
+      }
+      case 13u: {
+        if ((vget(a, lanes, lane) & 1u) != 0u) { res = vget(b, lanes, lane); }
+        else { res = vget(c, lanes, lane); }
+      }
+      case 14u: { res = (vget(a, lanes, lane) >> b) & mask; }
+      case 15u: { res = vget(a, lanes, lane) & mask; }
+      case 16u: {
+        let src_mask = mask_of(c);
+        let sign = 1u << (c - 1u);
+        let v = vget(a, lanes, lane) & src_mask;
+        if ((v & sign) != 0u) { res = (v | (~src_mask)) & mask; } else { res = v & mask; }
+      }
+      case 17u: { res = vget(a, lanes, lane) & mask; }
+      case 18u: { res = vget(a, lanes, lane) & mask; }
+      case 19u: { sig[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
+      case 20u: { reg_next[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
+      default: {}
+    }
+    if (!is_effect) { values[f1 * lanes + lane] = res; }
+    r = r + 1u;
+  }
+}
+
+@compute @workgroup_size({WG})
+fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let lanes = params[0];
+  let lane = gid.x;
+  if (lane >= lanes) { return; }
+  let steps = params[3];
+  let async_b = params[8]; let async_e = params[9];
+  let comb_b = params[4]; let comb_e = params[5];
+  let tnext_b = params[6]; let tnext_e = params[7];
+  let cap_count = params[12];
+  var s = 0u;
+  loop {
+    if (s >= steps) { break; }
+    run_block(async_b, async_e, lanes, lane);
+    run_block(comb_b, comb_e, lanes, lane);
+    run_block(tnext_b, tnext_e, lanes, lane);
+    var i = 0u;
+    loop {
+      if (i >= cap_count) { break; }
+      let off = captured[i];
+      sig[off * lanes + lane] = reg_next[off * lanes + lane];
+      i = i + 1u;
+    }
+    run_block(async_b, async_e, lanes, lane);
+    run_block(comb_b, comb_e, lanes, lane);
+    s = s + 1u;
+  }
+}
+"#;
+
+/// GPU batch simulator that executes an [`InterpProgram`] with the fixed-size
+/// interpreter kernel (design-as-data). Shader is O(1) in design size.
+pub struct InterpGpuSimulator {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    sig_buffer: wgpu::Buffer,
+    sig_readback: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    lanes: usize,
+    total_signal_words: usize,
+}
+
+fn storage_words(words: usize) -> u64 {
+    (words.max(1) * 4) as u64
+}
+
+impl InterpGpuSimulator {
+    pub fn new(program: &InterpProgram, lanes: usize) -> Result<Self, ErrorReport> {
+        pollster::block_on(Self::new_async(program, lanes))
+    }
+
+    async fn new_async(program: &InterpProgram, lanes: usize) -> Result<Self, ErrorReport> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| interp_error("no suitable GPU adapter found"))?;
+        // The interpreter needs 6 storage buffers; downlevel defaults cap at 4.
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("rrtl-interp-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: adapter.limits(),
+                },
+                None,
+            )
+            .await
+            .map_err(|err| interp_error(format!("failed to create GPU device: {err}")))?;
+
+        // Concatenate the four blocks; record ranges (in records) for params.
+        let mut code: Vec<u32> = Vec::new();
+        let mut ranges = [0u32; 8]; // [async_b,async_e, comb_b,comb_e, tnext_b,tnext_e, commit_b,commit_e]
+        for (i, block) in program.blocks.iter().enumerate() {
+            let begin = (code.len() / RECORD_WORDS) as u32;
+            code.extend_from_slice(block);
+            let end = (code.len() / RECORD_WORDS) as u32;
+            ranges[i * 2] = begin;
+            ranges[i * 2 + 1] = end;
+        }
+        let captured: Vec<u32> = program.captured_offsets().iter().map(|&o| o as u32).collect();
+
+        let params: Vec<u32> = vec![
+            lanes as u32,
+            program.num_values as u32,
+            program.total_signal_words as u32,
+            0, // steps, set per tick_many
+            ranges[2], // comb_b
+            ranges[3], // comb_e
+            ranges[4], // tnext_b
+            ranges[5], // tnext_e
+            ranges[0], // async_b
+            ranges[1], // async_e
+            ranges[6], // commit_b (unused)
+            ranges[7], // commit_e (unused)
+            captured.len() as u32,
+        ];
+
+        let storage = |label, words: usize, data: Option<&[u32]>| {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: storage_words(words),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            if let Some(data) = data {
+                if !data.is_empty() {
+                    queue.write_buffer(&buf, 0, bytemuck::cast_slice(data));
+                }
+            }
+            buf
+        };
+
+        let sig_words = program.total_signal_words * lanes;
+        let value_words = program.num_values * lanes;
+        let zeros_sig = vec![0u32; sig_words];
+        let sig_buffer = storage("interp-sig", sig_words, Some(&zeros_sig));
+        let reg_next_buffer = storage("interp-reg-next", sig_words, Some(&zeros_sig));
+        let values_buffer = storage("interp-values", value_words, Some(&vec![0u32; value_words]));
+        let code_buffer = storage("interp-code", code.len(), Some(&code));
+        let captured_buffer = storage("interp-captured", captured.len(), Some(&captured));
+        let params_buffer = storage("interp-params", params.len(), Some(&params));
+
+        let sig_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("interp-sig-readback"),
+            size: storage_words(sig_words),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: binding >= 3,
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("interp-layout"),
+            entries: &entries,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("interp-bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sig_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: reg_next_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: values_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: code_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: captured_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: params_buffer.as_entire_binding() },
+            ],
+        });
+
+        let source = INTERP_WGSL.replace("{WG}", &crate::WORKGROUP_SIZE.to_string());
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interp-kernel"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interp-pipeline-layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("interp-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "interp_main",
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group,
+            sig_buffer,
+            sig_readback,
+            params_buffer,
+            lanes,
+            total_signal_words: program.total_signal_words,
+        })
+    }
+
+    pub fn set_signal(&self, offset: usize, lane_values: &[u32]) {
+        // Storage is WordMajor, so a signal's lanes are contiguous at offset*lanes.
+        self.queue.write_buffer(
+            &self.sig_buffer,
+            (offset * self.lanes * 4) as u64,
+            bytemuck::cast_slice(lane_values),
+        );
+    }
+
+    pub fn tick_many(&self, steps: usize) {
+        self.queue
+            .write_buffer(&self.params_buffer, 3 * 4, bytemuck::cast_slice(&[steps as u32]));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("interp-tick") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("interp-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            let groups = (self.lanes as u32).div_ceil(crate::WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
+    pub fn get_signal(&self, offset: usize) -> Vec<u32> {
+        let words = self.total_signal_words * self.lanes;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("interp-readback"),
+            });
+        encoder.copy_buffer_to_buffer(&self.sig_buffer, 0, &self.sig_readback, 0, storage_words(words));
+        self.queue.submit(Some(encoder.finish()));
+        let slice = self.sig_readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let all = bytemuck::cast_slice::<u8, u32>(&data);
+        let result = (0..self.lanes)
+            .map(|lane| all[offset * self.lanes + lane])
+            .collect();
+        drop(data);
+        self.sig_readback.unmap();
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
