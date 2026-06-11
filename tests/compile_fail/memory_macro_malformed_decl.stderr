@@ -1,0 +1,5 @@
+error: expected memory addr(<integer literal>)
+ --> tests/compile_fail/memory_macro_malformed_decl.rs:8:23
+  |
+8 |             mem regs: data uint(8), depth 4,
+  |                       ^^^^

@@ -1,0 +1,5 @@
+error: expected `=`
+ --> tests/compile_fail/logic_macro_malformed_assign_bundle.rs:6:30
+  |
+6 |             assign_bundle out: input;
+  |                              ^

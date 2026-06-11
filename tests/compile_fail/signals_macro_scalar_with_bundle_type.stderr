@@ -1,0 +1,5 @@
+error: scalar signal declarations require uint(width) or sint(width)
+ --> tests/compile_fail/signals_macro_scalar_with_bundle_type.rs:6:24
+  |
+6 |             input req: Req {
+  |                        ^^^

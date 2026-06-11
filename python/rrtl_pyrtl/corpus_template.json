@@ -1,0 +1,15 @@
+{
+  "targets": [
+    {
+      "name": "my_counter",
+      "target": "my_designs.counter:build",
+      "top_name": "MyCounter",
+      "clock_name": "clk",
+      "reset_working_block": true,
+      "inputs": [
+        { "en": 1 },
+        { "en": 0 }
+      ]
+    }
+  ]
+}

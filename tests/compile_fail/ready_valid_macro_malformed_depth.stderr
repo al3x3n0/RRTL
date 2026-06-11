@@ -1,0 +1,5 @@
+error: expected ready/valid FIFO depth <integer literal>
+  --> tests/compile_fail/ready_valid_macro_malformed_depth.rs:17:51
+   |
+17 |             fifo fifo: input => output, clk, rst, size 3;
+   |                                                   ^^^^

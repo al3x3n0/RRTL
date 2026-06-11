@@ -1,0 +1,5 @@
+error: expected uint(width), sint(width), or NestedName { ... }
+ --> tests/compile_fail/bundle_macro_malformed_nested.rs:4:19
+  |
+4 |             meta: Meta(),
+  |                   ^^^^

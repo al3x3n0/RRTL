@@ -1,0 +1,5 @@
+error: expected uint(width), sint(width), or NestedName { ... }
+ --> tests/compile_fail/bundle_macro_unsupported_constructor.rs:4:19
+  |
+4 |             data: bits(8),
+  |                   ^^^^

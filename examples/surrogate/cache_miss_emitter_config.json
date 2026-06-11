@@ -1,0 +1,77 @@
+{
+  "schema": "rrtl-surrogate-event-emitter-config-v1",
+  "top_name": "InstrumentedCache",
+  "source_hash": "example-cache-miss-trace",
+  "target": "cache_miss",
+  "window_cycles": 2,
+  "horizon_cycles": 1,
+  "signal_features": [
+    {
+      "constant": 0,
+      "name": "cycle_delta"
+    },
+    {
+      "field": "load",
+      "name": "load",
+      "source": "inputs"
+    },
+    {
+      "field": "store",
+      "name": "store",
+      "source": "inputs"
+    },
+    {
+      "field": "addr_low",
+      "name": "addr_low",
+      "source": "inputs"
+    },
+    {
+      "field": "cache_set",
+      "name": "cache_set",
+      "source": "inputs"
+    },
+    {
+      "field": "tag_delta",
+      "name": "tag_delta",
+      "source": "inputs"
+    },
+    {
+      "field": "pending_misses",
+      "name": "pending_misses",
+      "source": "outputs"
+    },
+    {
+      "field": "store_buffer_occupancy",
+      "name": "store_buffer_occupancy",
+      "source": "outputs"
+    }
+  ],
+  "program_features": [
+    {
+      "constant": 4096,
+      "name": "pc"
+    },
+    {
+      "constant": 1,
+      "name": "opcode_id"
+    },
+    {
+      "constant": 64,
+      "name": "stride"
+    },
+    {
+      "constant": 14,
+      "name": "working_set_log2"
+    }
+  ],
+  "lane": {
+    "field": "lane",
+    "name": "lane",
+    "source": "inputs"
+  },
+  "label": {
+    "field": "miss",
+    "name": "cache_miss",
+    "source": "outputs"
+  }
+}

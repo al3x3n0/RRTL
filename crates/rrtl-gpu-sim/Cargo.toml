@@ -1,0 +1,19 @@
+[package]
+name = "rrtl-gpu-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+rrtl-core = { path = "../rrtl-core" }
+rrtl-ir = { path = "../rrtl-ir" }
+rrtl-sim-ir = { path = "../rrtl-sim-ir" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wgpu = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

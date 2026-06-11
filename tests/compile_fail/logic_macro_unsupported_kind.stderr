@@ -1,0 +1,5 @@
+error: expected logic statement kind `assign`, `assign_bundle`, `assign_bundle_when`, `clock`, `reset`, `reset_low`, `async_reset`, `async_reset_low`, `next`, `state_next_hold`, `state_next`, `mem_write`, `assert`, `assert_when`, `assert_clocked`, `assert_msg`, `cover`, `cover_when`, `cover_clocked`, or `cover_msg`
+ --> tests/compile_fail/logic_macro_unsupported_kind.rs:6:13
+  |
+6 |             drive out = count;
+  |             ^^^^^

@@ -1,0 +1,96 @@
+{
+  "schema": "rrtl-instrumentation-trace-v1",
+  "top_name": "InstrumentedCache",
+  "source_hash": "example-cache-miss-instrumentation",
+  "program_id": "cache-walk-smoke",
+  "steps": [
+    {
+      "cycle": 0,
+      "lane": 0,
+      "signals": {
+        "addr_low": 16,
+        "cache_set": 1,
+        "load": 1,
+        "pending_misses": 2,
+        "store": 0,
+        "store_buffer_occupancy": 0,
+        "tag_delta": 1
+      },
+      "program": {
+        "opcode_id": 1,
+        "pc": 4096,
+        "stride": 64,
+        "working_set_log2": 14
+      },
+      "labels": {
+        "miss": 0
+      }
+    },
+    {
+      "cycle": 1,
+      "lane": 1,
+      "signals": {
+        "addr_low": 80,
+        "cache_set": 2,
+        "load": 1,
+        "pending_misses": 1,
+        "store": 0,
+        "store_buffer_occupancy": 0,
+        "tag_delta": 1
+      },
+      "program": {
+        "opcode_id": 1,
+        "pc": 4100,
+        "stride": 64,
+        "working_set_log2": 14
+      },
+      "labels": {
+        "miss": 0
+      }
+    },
+    {
+      "cycle": 2,
+      "lane": 1,
+      "signals": {
+        "addr_low": 24,
+        "cache_set": 1,
+        "load": 0,
+        "pending_misses": 0,
+        "store": 0,
+        "store_buffer_occupancy": 0,
+        "tag_delta": 0
+      },
+      "program": {
+        "opcode_id": 1,
+        "pc": 4104,
+        "stride": 64,
+        "working_set_log2": 14
+      },
+      "labels": {
+        "miss": 1
+      }
+    },
+    {
+      "cycle": 3,
+      "lane": 0,
+      "signals": {
+        "addr_low": 32,
+        "cache_set": 3,
+        "load": 1,
+        "pending_misses": 3,
+        "store": 0,
+        "store_buffer_occupancy": 0,
+        "tag_delta": 1
+      },
+      "program": {
+        "opcode_id": 1,
+        "pc": 4108,
+        "stride": 64,
+        "working_set_log2": 14
+      },
+      "labels": {
+        "miss": 1
+      }
+    }
+  ]
+}

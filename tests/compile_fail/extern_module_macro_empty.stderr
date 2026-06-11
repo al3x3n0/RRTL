@@ -1,0 +1,5 @@
+error: extern_module! must contain at least one port
+ --> tests/compile_fail/extern_module_macro_empty.rs:7:16
+  |
+7 |         design EmptyVendor {}
+  |                ^^^^^^^^^^^

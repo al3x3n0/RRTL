@@ -1,0 +1,25 @@
+{
+  "targets": [
+    {
+      "name": "smoke_counter",
+      "target": "rrtl_pyrtl.examples:counter",
+      "top_name": "SmokeCounter",
+      "inputs": [
+        { "en": 1 },
+        { "en": 1 },
+        { "en": 0 },
+        { "en": 1 }
+      ]
+    },
+    {
+      "name": "smoke_alu",
+      "target": "rrtl_pyrtl.examples:alu",
+      "top_name": "SmokeAlu",
+      "inputs": [
+        { "a": 3, "b": 5, "sel": 0 },
+        { "a": 3, "b": 5, "sel": 1 },
+        { "a": 12, "b": 2, "sel": 1 }
+      ]
+    }
+  ]
+}

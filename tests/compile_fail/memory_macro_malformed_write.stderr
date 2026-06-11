@@ -1,0 +1,5 @@
+error: expected `:`
+  --> tests/compile_fail/memory_macro_malformed_write.rs:18:28
+   |
+18 |             mem_write regs = clk, we, waddr, wdata;
+   |                            ^

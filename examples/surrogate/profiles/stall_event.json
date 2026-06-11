@@ -1,0 +1,36 @@
+{
+  "schema": "rrtl-surrogate-event-profile-v1",
+  "target": "stall_event",
+  "surrogate_id": "stall_event_predictor",
+  "signal_features": [
+    "cycle_delta",
+    "load",
+    "store",
+    "pending_misses",
+    "store_buffer_occupancy"
+  ],
+  "program_features": [
+    "pc",
+    "opcode_id"
+  ],
+  "label": {
+    "name": "stall_event",
+    "kind": "binary",
+    "positive_value": 1
+  },
+  "input_window_cycles_default": 8,
+  "horizon_cycles_default": 1,
+  "mock_rule": {
+    "kind": "linear_threshold",
+    "description": "pressure = pending_peak*2 + store_buffer_peak + stores + load/store mix; stall if pressure >= 12",
+    "threshold": 12,
+    "terms": [
+      {"source": "signal", "feature": "pending_misses", "reduction": "max", "weight": 2},
+      {"source": "signal", "feature": "store_buffer_occupancy", "reduction": "max", "weight": 1},
+      {"source": "signal", "feature": "store", "reduction": "sum", "weight": 1}
+    ],
+    "bonuses": [
+      {"source": "signal", "feature": "load", "reduction": "sum", "op": ">=", "value": 1, "bonus": 2}
+    ]
+  }
+}

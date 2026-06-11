@@ -1,0 +1,43 @@
+{
+  "schema": "rrtl-surrogate-event-profile-v1",
+  "target": "cache_miss",
+  "surrogate_id": "cache_miss_event_predictor",
+  "signal_features": [
+    "cycle_delta",
+    "load",
+    "store",
+    "addr_low",
+    "cache_set",
+    "tag_delta",
+    "pending_misses",
+    "store_buffer_occupancy"
+  ],
+  "program_features": [
+    "pc",
+    "opcode_id",
+    "stride",
+    "working_set_log2"
+  ],
+  "label": {
+    "name": "cache_miss",
+    "kind": "binary",
+    "positive_value": 1
+  },
+  "input_window_cycles_default": 8,
+  "horizon_cycles_default": 1,
+  "mock_rule": {
+    "kind": "linear_threshold",
+    "description": "pressure = loads*2 + tag_motion*3 + pending_peak + set_span + ws/stride bonuses; miss if pressure >= 14",
+    "threshold": 14,
+    "terms": [
+      {"source": "signal", "feature": "load", "reduction": "sum", "weight": 2},
+      {"source": "signal", "feature": "tag_delta", "reduction": "sum", "weight": 3},
+      {"source": "signal", "feature": "pending_misses", "reduction": "max", "weight": 1},
+      {"source": "signal", "feature": "cache_set", "reduction": "unique_count", "weight": 1}
+    ],
+    "bonuses": [
+      {"source": "program", "feature": "working_set_log2", "op": ">=", "value": 14, "bonus": 4},
+      {"source": "program", "feature": "stride", "op": ">=", "value": 64, "bonus": 3}
+    ]
+  }
+}

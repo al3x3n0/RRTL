@@ -1,0 +1,5 @@
+error: state! must contain at least one variant
+ --> tests/compile_fail/state_macro_empty_variants.rs:3:9
+  |
+3 |         BadState: uint(1) {}
+  |         ^^^^^^^^

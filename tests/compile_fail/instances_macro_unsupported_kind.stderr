@@ -1,0 +1,5 @@
+error: expected instance statement kind `instance`, `instance_bundles`, or `instance_interfaces`
+ --> tests/compile_fail/instances_macro_unsupported_kind.rs:9:13
+  |
+9 |             connect u_child: Child {
+  |             ^^^^^^^

@@ -1,0 +1,18 @@
+[package]
+name = "rrtl-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rrtl-core = { path = "../rrtl-core" }
+rrtl-gpu-sim = { path = "../rrtl-gpu-sim" }
+rrtl-ir = { path = "../rrtl-ir" }
+rrtl-sim-ir = { path = "../rrtl-sim-ir" }
+rrtl-surrogate = { path = "../rrtl-surrogate" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

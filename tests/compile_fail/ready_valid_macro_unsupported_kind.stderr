@@ -1,0 +1,5 @@
+error: expected ready/valid helper kind `connect`, `register_slice`, `skid_buffer`, `fifo`, or `mem_fifo`
+  --> tests/compile_fail/ready_valid_macro_unsupported_kind.rs:17:13
+   |
+17 |             pipe slice: input => output, clk, rst;
+   |             ^^^^

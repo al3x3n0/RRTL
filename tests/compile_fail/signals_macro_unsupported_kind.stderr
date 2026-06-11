@@ -1,0 +1,5 @@
+error: expected signal declaration kind `input`, `output`, `wire`, `reg`, `input_bundle`, `output_bundle`, `wire_bundle`, `interface`, `mem`, `rv_sink`, or `rv_source`
+ --> tests/compile_fail/signals_macro_unsupported_kind.rs:6:13
+  |
+6 |             sink clk: uint(1),
+  |             ^^^^

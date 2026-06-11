@@ -1,0 +1,5 @@
+error: bundle signal declarations require BundleName { ... }
+ --> tests/compile_fail/signals_macro_bundle_with_scalar_type.rs:6:31
+  |
+6 |             input_bundle req: uint(1),
+  |                               ^^^^

@@ -1,0 +1,5 @@
+error: expected external port direction `input`, `output`, or `inout`
+ --> tests/compile_fail/extern_module_macro_unsupported_direction.rs:8:13
+  |
+8 |             clock CLK: uint(1),
+  |             ^^^^^

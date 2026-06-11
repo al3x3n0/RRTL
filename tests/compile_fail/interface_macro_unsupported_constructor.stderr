@@ -1,0 +1,5 @@
+error: expected uint(width), sint(width), or NestedName { ... }
+ --> tests/compile_fail/interface_macro_unsupported_constructor.rs:4:25
+  |
+4 |             input data: bits(8),
+  |                         ^^^^

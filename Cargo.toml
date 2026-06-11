@@ -1,0 +1,54 @@
+[package]
+name = "rrtl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[workspace]
+members = [
+    ".",
+    "crates/rrtl-ir",
+    "crates/rrtl-core",
+    "crates/rrtl-macros",
+    "crates/rrtl-sv",
+    "crates/rrtl-sim-ir",
+    "crates/rrtl-gpu-sim",
+    "crates/rrtl-runtime",
+    "crates/rrtl-pyrtl",
+    "crates/rrtl-surrogate",
+    "crates/rrtl-sv-frontend",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/rrtl"
+
+[workspace.dependencies]
+proc-macro2 = "1"
+quote = "1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "api-24", "download-binaries", "copy-dylibs", "ndarray", "tls-native"] }
+syn = { version = "2", features = ["full"] }
+bytemuck = "1"
+pollster = "0.3"
+wgpu = "0.19"
+
+[dependencies]
+rrtl-core = { path = "crates/rrtl-core" }
+rrtl-ir = { path = "crates/rrtl-ir" }
+rrtl-macros = { path = "crates/rrtl-macros" }
+rrtl-runtime = { path = "crates/rrtl-runtime" }
+rrtl-sv = { path = "crates/rrtl-sv" }
+rrtl-sv-frontend = { path = "crates/rrtl-sv-frontend" }
+
+[dev-dependencies]
+trybuild = "1"
+
+[lib]
+path = "src/lib.rs"

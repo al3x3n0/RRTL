@@ -1,0 +1,5 @@
+error: expected interface port direction `input` or `output`
+ --> tests/compile_fail/interface_macro_unsupported_direction.rs:4:13
+  |
+4 |             sink req: uint(1),
+  |             ^^^^

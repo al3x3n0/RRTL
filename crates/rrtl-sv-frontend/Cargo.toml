@@ -1,0 +1,20 @@
+[package]
+name = "rrtl-sv-frontend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rrtl-core = { path = "../rrtl-core" }
+rrtl-ir = { path = "../rrtl-ir" }
+rrtl-sv = { path = "../rrtl-sv" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sv2rrtl"
+path = "src/main.rs"

@@ -1,0 +1,5 @@
+error: expected `=>`
+ --> tests/compile_fail/state_macro_malformed_transition.rs:7:30
+  |
+7 |                 start.value(): Run,
+  |                              ^

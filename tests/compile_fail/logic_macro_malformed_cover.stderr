@@ -1,0 +1,5 @@
+error: expected `:`
+ --> tests/compile_fail/logic_macro_malformed_cover.rs:6:25
+  |
+6 |             cover count = count.value();
+  |                         ^

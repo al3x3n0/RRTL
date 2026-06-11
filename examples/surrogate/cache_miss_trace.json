@@ -1,0 +1,80 @@
+{
+  "schema": "rrtl-pyrtl-trace-v1",
+  "steps": [
+    {
+      "inputs": {
+        "addr_low": 16,
+        "cache_set": 1,
+        "lane": 0,
+        "load": 1,
+        "store": 0,
+        "tag_delta": 1
+      },
+      "outputs": {
+        "miss": 0,
+        "pending_misses": 2,
+        "store_buffer_occupancy": 0
+      }
+    },
+    {
+      "inputs": {
+        "addr_low": 80,
+        "cache_set": 2,
+        "lane": 1,
+        "load": 1,
+        "store": 0,
+        "tag_delta": 1
+      },
+      "outputs": {
+        "miss": 0,
+        "pending_misses": 1,
+        "store_buffer_occupancy": 0
+      }
+    },
+    {
+      "inputs": {
+        "addr_low": 24,
+        "cache_set": 1,
+        "lane": 1,
+        "load": 0,
+        "store": 0,
+        "tag_delta": 0
+      },
+      "outputs": {
+        "miss": 1,
+        "pending_misses": 0,
+        "store_buffer_occupancy": 0
+      }
+    },
+    {
+      "inputs": {
+        "addr_low": 32,
+        "cache_set": 3,
+        "lane": 0,
+        "load": 1,
+        "store": 0,
+        "tag_delta": 1
+      },
+      "outputs": {
+        "miss": 0,
+        "pending_misses": 3,
+        "store_buffer_occupancy": 0
+      }
+    },
+    {
+      "inputs": {
+        "addr_low": 96,
+        "cache_set": 4,
+        "lane": 0,
+        "load": 0,
+        "store": 0,
+        "tag_delta": 0
+      },
+      "outputs": {
+        "miss": 0,
+        "pending_misses": 0,
+        "store_buffer_occupancy": 0
+      }
+    }
+  ]
+}

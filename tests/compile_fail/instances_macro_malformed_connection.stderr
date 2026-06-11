@@ -1,0 +1,5 @@
+error: expected `:`
+  --> tests/compile_fail/instances_macro_malformed_connection.rs:10:19
+   |
+10 |                 a = a,
+   |                   ^

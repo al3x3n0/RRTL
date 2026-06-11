@@ -1,0 +1,5 @@
+error: expected `:`
+ --> tests/compile_fail/logic_macro_malformed_assert.rs:6:26
+  |
+6 |             assert count = count.value();
+  |                          ^

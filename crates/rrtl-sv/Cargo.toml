@@ -1,0 +1,14 @@
+[package]
+name = "rrtl-sv"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rrtl-core = { path = "../rrtl-core" }
+rrtl-ir = { path = "../rrtl-ir" }
+
+[lib]
+path = "src/lib.rs"
+
