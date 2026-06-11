@@ -45,6 +45,12 @@ pub const OP_STORE_SIGNAL: u32 = 19;
 /// Effect: capture `value` (field `a`) as register at storage offset `field1`
 /// into the shadow next-state (committed at end of cycle).
 pub const OP_CAPTURE_REG: u32 = 20;
+/// Instr: read memory word `(mem_offset + addr) * lanes + lane`. Record fields:
+/// `a` = addr value id, `b` = mem_offset (word base), `c` = depth (bound).
+pub const OP_MEM_READ: u32 = 21;
+/// Effect: conditional memory write. Record fields: `field1` = mem_offset,
+/// `width` = depth, `a` = enable value, `b` = addr value, `c` = data value.
+pub const OP_MEM_WRITE: u32 = 22;
 
 /// Words per encoded record: `[op, dst_or_offset, width, a, b, c]`.
 pub const RECORD_WORDS: usize = 6;
@@ -64,6 +70,7 @@ pub enum InterpStream {
 pub struct InterpProgram {
     pub num_values: usize,
     pub total_signal_words: usize,
+    pub total_memory_words: usize,
     pub blocks: [Vec<u32>; 4],
 }
 
@@ -78,8 +85,13 @@ impl InterpProgram {
 
     pub fn encode(machine: &PackedMachineProgram) -> Result<Self, ErrorReport> {
         let source = &machine.source;
-        if !source.memories.is_empty() {
-            return Err(interp_error("interpreter kernel v1 does not support memories"));
+        for memory in &source.memories {
+            if memory.data_layout.limbs != 1 {
+                return Err(interp_error(format!(
+                    "interpreter kernel v1 supports memories up to 32-bit data; `{}` is {} bits",
+                    memory.name, memory.data_layout.width
+                )));
+            }
         }
         for signal in &source.signals {
             if signal.layout.limbs != 1 {
@@ -109,6 +121,7 @@ impl InterpProgram {
         Ok(Self {
             num_values,
             total_signal_words: source.total_signal_words,
+            total_memory_words: source.total_memory_words_per_lane,
             blocks,
         })
     }
@@ -180,11 +193,12 @@ fn encode_block(block: &PackedBlock, source: &PackedProgram) -> Result<Vec<u32>,
                     rhs.0 as u32,
                     value_width[lhs.0],
                 ),
+                PackedInstrKind::MemRead { memory, addr } => {
+                    let mem = &source.memories[*memory];
+                    rec(OP_MEM_READ, addr.0 as u32, mem.offset as u32, mem.depth as u32)
+                }
                 PackedInstrKind::Concat(_) => {
                     return Err(interp_error("interpreter kernel v1 does not support Concat"))
-                }
-                PackedInstrKind::MemRead { .. } => {
-                    return Err(interp_error("interpreter kernel v1 does not support MemRead"))
                 }
             }
         }
@@ -219,10 +233,22 @@ fn encode_block(block: &PackedBlock, source: &PackedProgram) -> Result<Vec<u32>,
                         0,
                     );
                 }
-                PackedEffect::MemoryWrite { .. } => {
-                    return Err(interp_error(
-                        "interpreter kernel v1 does not support memory writes",
-                    ))
+                PackedEffect::MemoryWrite {
+                    memory,
+                    enable,
+                    addr,
+                    data,
+                } => {
+                    let mem = &source.memories[*memory];
+                    push_record(
+                        &mut out,
+                        OP_MEM_WRITE,
+                        mem.offset as u32,
+                        mem.depth as u32,
+                        enable.0 as u32,
+                        addr.0 as u32,
+                        data.0 as u32,
+                    );
                 }
             }
         }
@@ -253,6 +279,7 @@ pub struct InterpRunner {
     storage: Vec<u32>,
     values: Vec<u32>,
     reg_next: Vec<u32>,
+    memories: Vec<u32>,
     captured_offsets: Vec<usize>,
 }
 
@@ -261,6 +288,7 @@ impl InterpRunner {
         let storage = vec![0u32; program.total_signal_words * lanes];
         let values = vec![0u32; program.num_values * lanes];
         let reg_next = storage.clone();
+        let memories = vec![0u32; program.total_memory_words * lanes];
         let captured_offsets = program.captured_offsets();
         Self {
             program,
@@ -268,6 +296,7 @@ impl InterpRunner {
             storage,
             values,
             reg_next,
+            memories,
             captured_offsets,
         }
     }
@@ -292,6 +321,7 @@ impl InterpRunner {
     pub fn tick(&mut self) {
         self.eval_combinational();
         self.eval_block(InterpStream::TickNext);
+        self.eval_block(InterpStream::TickCommit); // memory writes
         self.commit();
         self.eval_combinational();
     }
@@ -307,6 +337,7 @@ impl InterpRunner {
         self.eval_combinational();
         for _ in 0..steps {
             self.eval_block(InterpStream::TickNext);
+            self.eval_block(InterpStream::TickCommit); // memory writes
             self.commit();
             self.eval_combinational();
         }
@@ -328,6 +359,7 @@ impl InterpRunner {
             storage,
             values,
             reg_next,
+            memories,
             ..
         } = self;
         let lanes = *lanes;
@@ -380,6 +412,22 @@ impl InterpRunner {
                         reg_next[field1 * lanes + lane] = val(a) & mask;
                         continue;
                     }
+                    OP_MEM_READ => {
+                        let addr = val(a) as usize; // a = addr value, b = mem_offset, c = depth
+                        if addr < c as usize {
+                            memories[(b as usize + addr) * lanes + lane] & mask
+                        } else {
+                            0
+                        }
+                    }
+                    OP_MEM_WRITE => {
+                        // field1 = mem_offset, width = depth, a = enable, b = addr, c = data
+                        let addr = val(b) as usize;
+                        if val(a) & 1 != 0 && addr < width as usize {
+                            memories[(field1 + addr) * lanes + lane] = val(c);
+                        }
+                        continue;
+                    }
                     _ => unreachable!("unknown interp opcode {op}"),
                 };
                 values[field1 * lanes + lane] = result;
@@ -399,6 +447,7 @@ const INTERP_WGSL: &str = r#"
 @group(0) @binding(3) var<storage, read> code: array<u32>;
 @group(0) @binding(4) var<storage, read> captured: array<u32>;
 @group(0) @binding(5) var<storage, read> params: array<u32>;
+@group(0) @binding(6) var<storage, read_write> mem: array<u32>;
 
 fn mask_of(width: u32) -> u32 {
   if (width == 0u) { return 0u; }
@@ -459,6 +508,17 @@ fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
       case 18u: { res = vget(a, lanes, lane) & mask; }
       case 19u: { sig[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
       case 20u: { reg_next[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
+      case 21u: {
+        let addr = vget(a, lanes, lane);
+        if (addr < c) { res = mem[(b + addr) * lanes + lane] & mask; } else { res = 0u; }
+      }
+      case 22u: {
+        let addr = vget(b, lanes, lane);
+        if (((vget(a, lanes, lane) & 1u) != 0u) && (addr < width)) {
+          mem[(f1 + addr) * lanes + lane] = vget(c, lanes, lane);
+        }
+        is_effect = true;
+      }
       default: {}
     }
     if (!is_effect) { values[f1 * lanes + lane] = res; }
@@ -475,6 +535,7 @@ fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let async_b = params[8]; let async_e = params[9];
   let comb_b = params[4]; let comb_e = params[5];
   let tnext_b = params[6]; let tnext_e = params[7];
+  let commit_b = params[10]; let commit_e = params[11];
   let cap_count = params[12];
   // Settle combinational logic once; each cycle then captures, commits, and
   // re-settles. This fuses the otherwise-redundant trailing/leading comb passes
@@ -485,6 +546,7 @@ fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   loop {
     if (s >= steps) { break; }
     run_block(tnext_b, tnext_e, lanes, lane);
+    run_block(commit_b, commit_e, lanes, lane); // tick_commit: memory writes
     var i = 0u;
     loop {
       if (i >= cap_count) { break; }
@@ -509,8 +571,10 @@ pub struct InterpGpuSimulator {
     sig_buffer: wgpu::Buffer,
     sig_readback: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
+    mem_buffer: wgpu::Buffer,
     lanes: usize,
     total_signal_words: usize,
+    total_memory_words: usize,
 }
 
 fn storage_words(words: usize) -> u64 {
@@ -599,6 +663,8 @@ impl InterpGpuSimulator {
         let code_buffer = storage("interp-code", code.len(), Some(&code));
         let captured_buffer = storage("interp-captured", captured.len(), Some(&captured));
         let params_buffer = storage("interp-params", params.len(), Some(&params));
+        let mem_words = program.total_memory_words * lanes;
+        let mem_buffer = storage("interp-mem", mem_words, Some(&vec![0u32; mem_words]));
 
         let sig_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interp-sig-readback"),
@@ -607,13 +673,15 @@ impl InterpGpuSimulator {
             mapped_at_creation: false,
         });
 
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+        // Bindings 3,4,5 (code, captured, params) are read-only; 0,1,2,6
+        // (sig, reg_next, values, mem) are read-write.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage {
-                        read_only: binding >= 3,
+                        read_only: (3..=5).contains(&binding),
                     },
                     has_dynamic_offset: false,
                     min_binding_size: None,
@@ -635,6 +703,7 @@ impl InterpGpuSimulator {
                 wgpu::BindGroupEntry { binding: 3, resource: code_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: captured_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: mem_buffer.as_entire_binding() },
             ],
         });
 
@@ -663,8 +732,10 @@ impl InterpGpuSimulator {
             sig_buffer,
             sig_readback,
             params_buffer,
+            mem_buffer,
             lanes,
             total_signal_words: program.total_signal_words,
+            total_memory_words: program.total_memory_words,
         })
     }
 
@@ -673,10 +744,15 @@ impl InterpGpuSimulator {
     /// fully rewritten before being read each cycle. Used to reuse one simulator
     /// across independent lane tiles.
     pub fn reset(&self) {
-        let zeros = vec![0u32; self.total_signal_words * self.lanes];
-        if !zeros.is_empty() {
+        let sig = vec![0u32; self.total_signal_words * self.lanes];
+        if !sig.is_empty() {
             self.queue
-                .write_buffer(&self.sig_buffer, 0, bytemuck::cast_slice(&zeros));
+                .write_buffer(&self.sig_buffer, 0, bytemuck::cast_slice(&sig));
+        }
+        let mem = vec![0u32; self.total_memory_words * self.lanes];
+        if !mem.is_empty() {
+            self.queue
+                .write_buffer(&self.mem_buffer, 0, bytemuck::cast_slice(&mem));
         }
     }
 
@@ -846,6 +922,65 @@ mod tests {
         let r: Vec<u32> = runner.get_signal(offset(acc_out));
         let c: Vec<u32> = cpu.get_signal(acc_out).unwrap().iter().map(|&v| v as u32).collect();
         assert_eq!(r, c);
+    }
+
+    /// A design with a memory (write + read port) must match SimdCpuSimulator
+    /// cycle by cycle and across lanes.
+    #[test]
+    fn interp_runner_matches_simd_cpu_with_memory() {
+        let mut design = Design::new();
+        let (clk, we, waddr, wdata, raddr, rdata);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            we = m.input("we", uint(1));
+            waddr = m.input("waddr", uint(2));
+            wdata = m.input("wdata", uint(16));
+            raddr = m.input("raddr", uint(2));
+            let mem = m.mem("mem", 2, uint(16), 4);
+            rdata = m.output("rdata", uint(16));
+            m.mem_write(mem, clk, we, waddr, wdata);
+            let rd = m.mem_read(mem, raddr);
+            m.assign(rdata, rd);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| {
+            program.signals[program.signal_index(s).unwrap()].layout.offset
+        };
+        let lanes = 3;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+
+        let mut set = |runner: &mut InterpRunner, cpu: &mut SimdCpuSimulator, s: rrtl_ir::Signal, base: u32| {
+            let v: Vec<u32> = (0..lanes as u32).map(|l| base.wrapping_add(l * 5) & 0xffff).collect();
+            runner.set_signal(off(s), &v);
+            cpu.set_signal(s, &v.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+        };
+
+        // (we, waddr, wdata, raddr) per cycle.
+        let seq = [
+            (1, 0, 100, 0),
+            (1, 1, 200, 0),
+            (1, 2, 300, 1),
+            (0, 0, 0, 2),
+            (1, 3, 400, 3),
+            (0, 0, 0, 0),
+            (0, 0, 0, 3),
+        ];
+        for (cycle, &(w, wa, wd, ra)) in seq.iter().enumerate() {
+            set(&mut runner, &mut cpu, we, w);
+            set(&mut runner, &mut cpu, waddr, wa);
+            set(&mut runner, &mut cpu, wdata, wd);
+            set(&mut runner, &mut cpu, raddr, ra);
+            runner.tick();
+            cpu.tick();
+            let r = runner.get_signal(off(rdata));
+            let c: Vec<u32> = cpu.get_signal(rdata).unwrap().iter().map(|&v| v as u32).collect();
+            assert_eq!(r, c, "rdata mismatch at cycle {cycle}");
+        }
     }
 
     /// The design that makes the straight-line codegen emit a 115 MB WGSL
