@@ -297,8 +297,18 @@ impl InterpRunner {
     }
 
     pub fn tick_many(&mut self, steps: usize) {
+        if steps == 0 {
+            return;
+        }
+        // Fused: the trailing comb of one cycle and the leading comb of the next
+        // settle from the same register state (redundant), so settle once up
+        // front and once after each commit — halving combinational work while
+        // leaving the final state identical to `steps` separate `tick`s.
+        self.eval_combinational();
         for _ in 0..steps {
-            self.tick();
+            self.eval_block(InterpStream::TickNext);
+            self.commit();
+            self.eval_combinational();
         }
     }
 
@@ -466,11 +476,14 @@ fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let comb_b = params[4]; let comb_e = params[5];
   let tnext_b = params[6]; let tnext_e = params[7];
   let cap_count = params[12];
+  // Settle combinational logic once; each cycle then captures, commits, and
+  // re-settles. This fuses the otherwise-redundant trailing/leading comb passes
+  // (they settle from the same register state) — half the combinational work.
+  run_block(async_b, async_e, lanes, lane);
+  run_block(comb_b, comb_e, lanes, lane);
   var s = 0u;
   loop {
     if (s >= steps) { break; }
-    run_block(async_b, async_e, lanes, lane);
-    run_block(comb_b, comb_e, lanes, lane);
     run_block(tnext_b, tnext_e, lanes, lane);
     var i = 0u;
     loop {
@@ -782,6 +795,45 @@ mod tests {
             let c_flag: Vec<u32> = cpu.get_signal(flag_out).unwrap().iter().map(|&v| v as u32).collect();
             assert_eq!(r_flag, c_flag, "flag mismatch at cycle {cycle}");
         }
+    }
+
+    /// Fused `tick_many` (one comb settle per cycle) must reach the same final
+    /// state as `steps` separate ticks / SimdCpuSimulator.
+    #[test]
+    fn interp_runner_tick_many_matches_simd_cpu() {
+        let mut design = Design::new();
+        let (clk, din, acc_out);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            din = m.input("din", uint(16));
+            let acc = m.reg("acc", uint(16));
+            let w = m.wire("w", uint(16));
+            m.clock(acc, clk);
+            m.assign(w, acc * lit_u(5, 16) + din);
+            m.next(acc, w);
+            acc_out = m.output("acc_out", uint(16));
+            m.assign(acc_out, acc);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let offset = |sig: rrtl_ir::Signal| {
+            program.signals[program.signal_index(sig).unwrap()].layout.offset
+        };
+        let lanes = 4;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        let din_v: Vec<u32> = (0..lanes as u32).map(|l| 7 + l * 3).collect();
+        runner.set_signal(offset(clk), &vec![1u32; lanes]);
+        runner.set_signal(offset(din), &din_v);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+        cpu.set_signal(din, &din_v.iter().map(|&v| v as u128).collect::<Vec<_>>())
+            .unwrap();
+        runner.tick_many(20);
+        cpu.tick_many(20).unwrap();
+        let r: Vec<u32> = runner.get_signal(offset(acc_out));
+        let c: Vec<u32> = cpu.get_signal(acc_out).unwrap().iter().map(|&v| v as u32).collect();
+        assert_eq!(r, c);
     }
 
     /// The design that makes the straight-line codegen emit a 115 MB WGSL
