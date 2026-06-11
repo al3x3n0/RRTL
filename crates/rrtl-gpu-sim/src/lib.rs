@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod interp;
 pub mod lane_split;
+pub mod work_steal;
 
 pub const WORKGROUP_SIZE: u32 = 64;
 const TRACE_REPLAY_HEADER_WORDS: usize = 10;

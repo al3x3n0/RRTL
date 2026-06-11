@@ -668,6 +668,18 @@ impl InterpGpuSimulator {
         })
     }
 
+    /// Resets all signal/register state to zero. Only the persistent signal
+    /// buffer needs clearing — the value workspace and `reg_next` shadow are
+    /// fully rewritten before being read each cycle. Used to reuse one simulator
+    /// across independent lane tiles.
+    pub fn reset(&self) {
+        let zeros = vec![0u32; self.total_signal_words * self.lanes];
+        if !zeros.is_empty() {
+            self.queue
+                .write_buffer(&self.sig_buffer, 0, bytemuck::cast_slice(&zeros));
+        }
+    }
+
     pub fn set_signal(&self, offset: usize, lane_values: &[u32]) {
         // Storage is WordMajor, so a signal's lanes are contiguous at offset*lanes.
         self.queue.write_buffer(
