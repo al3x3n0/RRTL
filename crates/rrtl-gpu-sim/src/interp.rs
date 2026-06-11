@@ -52,6 +52,16 @@ pub const OP_MEM_READ: u32 = 21;
 /// Effect: conditional memory write. Record fields: `field1` = mem_offset,
 /// `width` = depth, `a` = enable value, `b` = addr value, `c` = data value.
 pub const OP_MEM_WRITE: u32 = 22;
+/// Instr: bit-concatenate. `a` = aux offset of the operand list, `b` = operand
+/// count. Each aux operand is `[value_id, width]`; operands are joined with the
+/// last operand in the least-significant bits.
+pub const OP_CONCAT: u32 = 23;
+/// Effect (async-reset stream): if the reset at aux offset `b` is asserted, set
+/// signal `field1` to that reset's value. Used for asynchronous resets.
+pub const OP_ASYNC_RESET: u32 = 24;
+
+/// Sentinel reset id (no reset) in an [`OP_CAPTURE_REG`] record's `b` field.
+pub const NO_RESET: u32 = u32::MAX;
 
 /// Words per encoded record: `[op, dst_or_offset, width, a, b, c]`.
 pub const RECORD_WORDS: usize = 6;
@@ -77,6 +87,10 @@ pub struct InterpProgram {
     pub total_signal_words: usize,
     pub total_memory_words: usize,
     pub blocks: [Vec<u32>; 4],
+    /// Side data for variable-size operands: Concat operand lists
+    /// (`[value_id, width]` pairs) and reset entries
+    /// (`[reset_signal_offset, reset_value, polarity]`, polarity 0=high/1=low).
+    pub aux: Vec<u32>,
 }
 
 fn interp_error(message: impl Into<String>) -> ErrorReport {
@@ -113,9 +127,12 @@ impl InterpProgram {
             &machine.streams.tick_next,
             &machine.streams.tick_commit,
         ];
+        let mut aux = Vec::new();
         let mut blocks: [Vec<u32>; 4] = Default::default();
-        for (slot, block) in blocks.iter_mut().zip(streams) {
-            *slot = encode_block(block, source)?;
+        for (index, (slot, block)) in blocks.iter_mut().zip(streams).enumerate() {
+            // streams[0] is async_reset_comb, whose register captures are
+            // immediate conditional stores rather than next-state captures.
+            *slot = encode_block(block, source, &mut aux, index == 0)?;
         }
         let num_values = streams
             .iter()
@@ -128,6 +145,7 @@ impl InterpProgram {
             total_signal_words: source.total_signal_words,
             total_memory_words: source.total_memory_words_per_lane,
             blocks,
+            aux,
         })
     }
 
@@ -154,7 +172,26 @@ fn block_value_count(block: &PackedBlock) -> usize {
         .unwrap_or(0)
 }
 
-fn encode_block(block: &PackedBlock, source: &PackedProgram) -> Result<Vec<u32>, ErrorReport> {
+/// Appends a reset entry `[reset_signal_offset, reset_value, polarity]` to `aux`
+/// and returns its offset. polarity: 0 = active-high, 1 = active-low.
+fn push_reset(aux: &mut Vec<u32>, source: &PackedProgram, reset: &rrtl_sim_ir::PackedReset) -> u32 {
+    let offset = aux.len() as u32;
+    let polarity = match reset.polarity {
+        rrtl_ir::ResetPolarity::ActiveHigh => 0,
+        rrtl_ir::ResetPolarity::ActiveLow => 1,
+    };
+    aux.push(source.signals[reset.signal].layout.offset as u32);
+    aux.push(reset.value.first().copied().unwrap_or(0));
+    aux.push(polarity);
+    offset
+}
+
+fn encode_block(
+    block: &PackedBlock,
+    source: &PackedProgram,
+    aux: &mut Vec<u32>,
+    is_async_reset: bool,
+) -> Result<Vec<u32>, ErrorReport> {
     // Pre-pass: width of every value produced in this block, for ops that need a
     // source operand's width (Sext, signed Lt).
     let mut value_width = vec![0u32; block_value_count(block)];
@@ -202,8 +239,13 @@ fn encode_block(block: &PackedBlock, source: &PackedProgram) -> Result<Vec<u32>,
                     let mem = &source.memories[*memory];
                     rec(OP_MEM_READ, addr.0 as u32, mem.offset as u32, mem.depth as u32)
                 }
-                PackedInstrKind::Concat(_) => {
-                    return Err(interp_error("interpreter kernel v1 does not support Concat"))
+                PackedInstrKind::Concat(parts) => {
+                    let aux_offset = aux.len() as u32;
+                    for part in parts {
+                        aux.push(part.0 as u32);
+                        aux.push(value_width[part.0]);
+                    }
+                    rec(OP_CONCAT, aux_offset, parts.len() as u32, 0);
                 }
             }
         }
@@ -222,21 +264,35 @@ fn encode_block(block: &PackedBlock, source: &PackedProgram) -> Result<Vec<u32>,
                     );
                 }
                 PackedEffect::CaptureReg { dst, value, reset } => {
-                    if reset.is_some() {
-                        return Err(interp_error(
-                            "interpreter kernel v1 does not support register resets",
-                        ));
-                    }
                     let layout = source.signals[*dst].layout;
-                    push_record(
-                        &mut out,
-                        OP_CAPTURE_REG,
-                        layout.offset as u32,
-                        layout.width,
-                        value.0 as u32,
-                        0,
-                        0,
-                    );
+                    if is_async_reset {
+                        // Immediate conditional store while reset is asserted.
+                        let reset = reset.as_ref().expect("async-reset capture has a reset");
+                        let reset_off = push_reset(aux, source, reset);
+                        push_record(
+                            &mut out,
+                            OP_ASYNC_RESET,
+                            layout.offset as u32,
+                            layout.width,
+                            0,
+                            reset_off,
+                            0,
+                        );
+                    } else {
+                        let reset_id = reset
+                            .as_ref()
+                            .map(|reset| push_reset(aux, source, reset))
+                            .unwrap_or(NO_RESET);
+                        push_record(
+                            &mut out,
+                            OP_CAPTURE_REG,
+                            layout.offset as u32,
+                            layout.width,
+                            value.0 as u32,
+                            reset_id,
+                            0,
+                        );
+                    }
                 }
                 PackedEffect::MemoryWrite {
                     memory,
@@ -368,6 +424,7 @@ impl InterpRunner {
             ..
         } = self;
         let lanes = *lanes;
+        let aux = &program.aux;
         let recs = program.block(stream);
         for record in recs.chunks_exact(RECORD_WORDS) {
             let (op, field1, width) = (record[0], record[1] as usize, record[2]);
@@ -375,6 +432,15 @@ impl InterpRunner {
             let mask = mask_of(width);
             for lane in 0..lanes {
                 let val = |id: u32| values[id as usize * lanes + lane];
+                let reset_asserted = |reset_id: u32| -> bool {
+                    let rs = aux[reset_id as usize] as usize;
+                    let bit = storage[rs * lanes + lane] & 1;
+                    if aux[reset_id as usize + 2] == 0 {
+                        bit != 0
+                    } else {
+                        bit == 0
+                    }
+                };
                 let result = match op {
                     OP_LIT => a & mask,
                     OP_SIGNAL => storage[a as usize * lanes + lane] & mask,
@@ -414,8 +480,36 @@ impl InterpRunner {
                         continue;
                     }
                     OP_CAPTURE_REG => {
-                        reg_next[field1 * lanes + lane] = val(a) & mask;
+                        // b = reset id (NO_RESET if none).
+                        let next = if b != NO_RESET && reset_asserted(b) {
+                            aux[b as usize + 1] & mask
+                        } else {
+                            val(a) & mask
+                        };
+                        reg_next[field1 * lanes + lane] = next;
                         continue;
+                    }
+                    OP_ASYNC_RESET => {
+                        // b = reset id; if asserted, drive the signal immediately.
+                        if reset_asserted(b) {
+                            storage[field1 * lanes + lane] = aux[b as usize + 1] & mask;
+                        }
+                        continue;
+                    }
+                    OP_CONCAT => {
+                        // a = aux offset of [value_id, width] pairs, b = count.
+                        let mut result = 0u32;
+                        let mut offset = 0u32;
+                        for k in (0..b).rev() {
+                            let vid = aux[(a + k * 2) as usize];
+                            let w = aux[(a + k * 2 + 1) as usize];
+                            let part = val(vid) & mask_of(w);
+                            if offset < 32 {
+                                result |= part << offset;
+                            }
+                            offset += w;
+                        }
+                        result & mask
                     }
                     OP_MEM_READ => {
                         let addr = val(a) as usize; // a = addr value, b = mem_offset, c = depth
@@ -453,6 +547,7 @@ const INTERP_WGSL: &str = r#"
 @group(0) @binding(4) var<storage, read> captured: array<u32>;
 @group(0) @binding(5) var<storage, read> params: array<u32>;
 @group(0) @binding(6) var<storage, read_write> mem: array<u32>;
+@group(0) @binding(7) var<storage, read> aux: array<u32>;
 
 fn mask_of(width: u32) -> u32 {
   if (width == 0u) { return 0u; }
@@ -461,6 +556,12 @@ fn mask_of(width: u32) -> u32 {
 }
 
 fn vget(id: u32, lanes: u32, lane: u32) -> u32 { return values[id * lanes + lane]; }
+
+fn reset_on(reset_id: u32, lanes: u32, lane: u32) -> bool {
+  let bit = sig[aux[reset_id] * lanes + lane] & 1u;
+  if (aux[reset_id + 2u] == 0u) { return bit != 0u; }
+  return bit == 0u;
+}
 
 fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
   var r = begin;
@@ -512,7 +613,29 @@ fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
       case 17u: { res = vget(a, lanes, lane) & mask; }
       case 18u: { res = vget(a, lanes, lane) & mask; }
       case 19u: { sig[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
-      case 20u: { reg_next[f1 * lanes + lane] = vget(a, lanes, lane) & mask; is_effect = true; }
+      case 20u: {
+        var next = vget(a, lanes, lane) & mask;
+        if (b != 0xffffffffu && reset_on(b, lanes, lane)) { next = aux[b + 1u] & mask; }
+        reg_next[f1 * lanes + lane] = next;
+        is_effect = true;
+      }
+      case 23u: {
+        var result = 0u;
+        var ofs = 0u;
+        var k = b;
+        loop {
+          if (k == 0u) { break; }
+          k = k - 1u;
+          let part = vget(aux[a + k * 2u], lanes, lane) & mask_of(aux[a + k * 2u + 1u]);
+          if (ofs < 32u) { result = result | (part << ofs); }
+          ofs = ofs + aux[a + k * 2u + 1u];
+        }
+        res = result & mask;
+      }
+      case 24u: {
+        if (reset_on(b, lanes, lane)) { sig[f1 * lanes + lane] = aux[b + 1u] & mask; }
+        is_effect = true;
+      }
       case 21u: {
         let addr = vget(a, lanes, lane);
         if (addr < c) { res = mem[(b + addr) * lanes + lane] & mask; } else { res = 0u; }
@@ -684,6 +807,7 @@ impl InterpGpuSimulator {
         let params_buffer = storage("interp-params", params.len(), Some(&params));
         let mem_words = program.total_memory_words * lanes;
         let mem_buffer = storage("interp-mem", mem_words, Some(&vec![0u32; mem_words]));
+        let aux_buffer = storage("interp-aux", program.aux.len(), Some(&program.aux));
 
         let sig_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interp-sig-readback"),
@@ -692,15 +816,15 @@ impl InterpGpuSimulator {
             mapped_at_creation: false,
         });
 
-        // Bindings 3,4,5 (code, captured, params) are read-only; 0,1,2,6
-        // (sig, reg_next, values, mem) are read-write.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7)
+        // Bindings 3,4,5,7 (code, captured, params, aux) are read-only;
+        // 0,1,2,6 (sig, reg_next, values, mem) are read-write.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage {
-                        read_only: (3..=5).contains(&binding),
+                        read_only: (3..=5).contains(&binding) || binding == 7,
                     },
                     has_dynamic_offset: false,
                     min_binding_size: None,
@@ -723,6 +847,7 @@ impl InterpGpuSimulator {
                 wgpu::BindGroupEntry { binding: 4, resource: captured_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: mem_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: aux_buffer.as_entire_binding() },
             ],
         });
 
@@ -942,6 +1067,94 @@ mod tests {
         let r: Vec<u32> = runner.get_signal(offset(acc_out));
         let c: Vec<u32> = cpu.get_signal(acc_out).unwrap().iter().map(|&v| v as u32).collect();
         assert_eq!(r, c);
+    }
+
+    #[test]
+    fn interp_runner_matches_simd_cpu_with_concat() {
+        let mut design = Design::new();
+        let (a, b, o);
+        {
+            let mut m = design.module("Top");
+            a = m.input("a", uint(8));
+            b = m.input("b", uint(4));
+            o = m.output("o", uint(12));
+            m.assign(o, rrtl_core::concat([a.value(), b.value()]));
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let lanes = 4;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        let av: Vec<u32> = (0..lanes as u32).map(|l| (l * 37 + 1) & 0xff).collect();
+        let bv: Vec<u32> = (0..lanes as u32).map(|l| (l * 5 + 2) & 0xf).collect();
+        runner.set_signal(off(a), &av);
+        runner.set_signal(off(b), &bv);
+        cpu.set_signal(a, &av.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+        cpu.set_signal(b, &bv.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+        runner.tick();
+        cpu.tick();
+        let r = runner.get_signal(off(o));
+        let c: Vec<u32> = cpu.get_signal(o).unwrap().iter().map(|&v| v as u32).collect();
+        assert_eq!(r, c);
+    }
+
+    #[test]
+    fn interp_runner_matches_simd_cpu_with_resets() {
+        let mut design = Design::new();
+        let (clk, rst, rstn, din, oqs, oqa);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            rst = m.input("rst", uint(1));
+            rstn = m.input("rstn", uint(1));
+            din = m.input("din", uint(8));
+            let qs = m.reg("qs", uint(8));
+            let qa = m.reg("qa", uint(8));
+            m.clock(qs, clk);
+            m.clock(qa, clk);
+            m.reset(qs, rst, 5);
+            m.async_reset_low(qa, rstn, 9);
+            m.next(qs, din);
+            m.next(qa, din);
+            oqs = m.output("oqs", uint(8));
+            oqa = m.output("oqa", uint(8));
+            m.assign(oqs, qs);
+            m.assign(oqa, qa);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let lanes = 3;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+
+        let mut set = |runner: &mut InterpRunner, cpu: &mut SimdCpuSimulator, s: rrtl_ir::Signal, vals: [u32; 3]| {
+            runner.set_signal(off(s), &vals);
+            cpu.set_signal(s, &vals.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+        };
+        // (rst, rstn, din) per cycle, varied across the 3 lanes via per-cycle arrays.
+        let seq: [([u32; 3], [u32; 3], [u32; 3]); 5] = [
+            ([1, 0, 1], [1, 1, 0], [10, 20, 30]),
+            ([0, 1, 0], [1, 0, 1], [40, 50, 60]),
+            ([0, 0, 1], [0, 1, 1], [70, 80, 90]),
+            ([1, 1, 0], [1, 1, 1], [11, 22, 33]),
+            ([0, 0, 0], [1, 1, 1], [44, 55, 66]),
+        ];
+        for (cycle, (r, rn, d)) in seq.iter().enumerate() {
+            set(&mut runner, &mut cpu, rst, *r);
+            set(&mut runner, &mut cpu, rstn, *rn);
+            set(&mut runner, &mut cpu, din, *d);
+            runner.tick();
+            cpu.tick();
+            for (sig, name) in [(oqs, "qs"), (oqa, "qa")] {
+                let rr = runner.get_signal(off(sig));
+                let cc: Vec<u32> = cpu.get_signal(sig).unwrap().iter().map(|&v| v as u32).collect();
+                assert_eq!(rr, cc, "{name} mismatch at cycle {cycle}");
+            }
+        }
     }
 
     /// A design with a memory (write + read port) must match SimdCpuSimulator
