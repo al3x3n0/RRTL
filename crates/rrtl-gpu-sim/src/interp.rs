@@ -681,6 +681,14 @@ impl InterpGpuSimulator {
             pass.dispatch_workgroups(groups, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        // No blocking wait here: the GPU runs asynchronously so the caller can
+        // do other work (e.g. simulate its own lanes on the CPU) concurrently.
+        // Submissions are ordered, so a later read drains this work. Call
+        // `synchronize` to wait explicitly.
+    }
+
+    /// Blocks until all submitted GPU work has completed.
+    pub fn synchronize(&self) {
         self.device.poll(wgpu::Maintain::Wait);
     }
 
