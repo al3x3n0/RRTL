@@ -242,7 +242,9 @@ fn encode_block(
                     rec(OP_SIGNAL, source.signals[*index].layout.offset as u32, 0, 0)
                 }
                 PackedInstrKind::Not(v) => rec(OP_NOT, v.0 as u32, 0, 0),
-                PackedInstrKind::Zext(v) => rec(OP_ZEXT, v.0 as u32, 0, 0),
+                // c carries the operand width where the result width differs
+                // from it (so the multi-limb kernel reads only the operand's limbs).
+                PackedInstrKind::Zext(v) => rec(OP_ZEXT, v.0 as u32, 0, value_width[v.0]),
                 PackedInstrKind::Trunc(v) => rec(OP_TRUNC, v.0 as u32, 0, 0),
                 PackedInstrKind::Cast(v) => rec(OP_CAST, v.0 as u32, 0, 0),
                 PackedInstrKind::Sext(v) => rec(OP_SEXT, v.0 as u32, 0, value_width[v.0]),
@@ -252,14 +254,16 @@ fn encode_block(
                 PackedInstrKind::Add(l, r) => rec(OP_ADD, l.0 as u32, r.0 as u32, 0),
                 PackedInstrKind::Sub(l, r) => rec(OP_SUB, l.0 as u32, r.0 as u32, 0),
                 PackedInstrKind::Mul(l, r) => rec(OP_MUL, l.0 as u32, r.0 as u32, 0),
-                PackedInstrKind::Eq(l, r) => rec(OP_EQ, l.0 as u32, r.0 as u32, 0),
-                PackedInstrKind::Ne(l, r) => rec(OP_NE, l.0 as u32, r.0 as u32, 0),
+                PackedInstrKind::Eq(l, r) => rec(OP_EQ, l.0 as u32, r.0 as u32, value_width[l.0]),
+                PackedInstrKind::Ne(l, r) => rec(OP_NE, l.0 as u32, r.0 as u32, value_width[l.0]),
                 PackedInstrKind::Mux {
                     cond,
                     then_value,
                     else_value,
                 } => rec(OP_MUX, cond.0 as u32, then_value.0 as u32, else_value.0 as u32),
-                PackedInstrKind::Slice { value, lsb } => rec(OP_SLICE, value.0 as u32, *lsb, 0),
+                PackedInstrKind::Slice { value, lsb } => {
+                    rec(OP_SLICE, value.0 as u32, *lsb, value_width[value.0])
+                }
                 PackedInstrKind::Lt { lhs, rhs, signed } => rec(
                     if *signed { OP_LT_S } else { OP_LT_U },
                     lhs.0 as u32,
@@ -764,11 +768,14 @@ fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
   }
 }
 
-// Multi-limb path (ml limbs of 32 bits each, ml in 2..=4). Operands are loaded
-// into fixed local arrays; multiply uses 16-bit half-products (16x16 fits u32).
-fn vload_ml(id: u32, ml: u32, lanes: u32, lane: u32) -> array<u32, 4> {
+// Multi-limb path. `ml` is the uniform value-slot stride; each op processes only
+// its own limb count (nl = result limbs, ol = operand limbs from `c`) so narrow
+// ops in a wide-max-limbs design pay only their own width. Multiply uses 16-bit
+// half-products (16x16 fits u32). Slots high limbs stay valid because no op reads
+// past a value's own width.
+fn vload_ml(id: u32, ml: u32, count: u32, lanes: u32, lane: u32) -> array<u32, 4> {
   var v = array<u32, 4>(0u, 0u, 0u, 0u);
-  for (var l = 0u; l < ml; l = l + 1u) { v[l] = values[(id * ml + l) * lanes + lane]; }
+  for (var l = 0u; l < count; l = l + 1u) { v[l] = values[(id * ml + l) * lanes + lane]; }
   return v;
 }
 
@@ -784,37 +791,38 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
     let b = code[base + 4u];
     let c = code[base + 5u];
     let nl = (width + 31u) / 32u;
+    let ol = (c + 31u) / 32u; // operand limbs (ops that set c)
     var res = array<u32, 4>(0u, 0u, 0u, 0u);
     var is_effect = false;
 
     switch op {
       case 0u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = aux[a + l]; } }
       case 1u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = sig[(a + l) * lanes + lane]; } }
-      case 2u: { var x = vload_ml(a, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = ~x[l]; } }
-      case 3u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] & y[l]; } }
-      case 4u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] | y[l]; } }
-      case 5u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] ^ y[l]; } }
+      case 2u: { var x = vload_ml(a, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~x[l]; } }
+      case 3u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] & y[l]; } }
+      case 4u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] | y[l]; } }
+      case 5u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] ^ y[l]; } }
       case 6u: {
-        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
         var carry = 0u;
-        for (var l = 0u; l < ml; l = l + 1u) {
+        for (var l = 0u; l < nl; l = l + 1u) {
           let s1 = x[l] + y[l]; let c1 = select(0u, 1u, s1 < x[l]);
           let s2 = s1 + carry; let c2 = select(0u, 1u, s2 < s1);
           res[l] = s2; carry = c1 + c2;
         }
       }
       case 7u: {
-        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
         var borrow = 0u;
-        for (var l = 0u; l < ml; l = l + 1u) {
+        for (var l = 0u; l < nl; l = l + 1u) {
           let d1 = x[l] - y[l]; let b1 = select(0u, 1u, x[l] < y[l]);
           let d2 = d1 - borrow; let b2 = select(0u, 1u, d1 < borrow);
           res[l] = d2; borrow = b1 + b2;
         }
       }
       case 8u: {
-        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
-        let halves = ml * 2u;
+        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
+        let halves = nl * 2u;
         var acc = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
         for (var i = 0u; i < halves; i = i + 1u) {
           let ai = (x[i / 2u] >> ((i & 1u) * 16u)) & 0xffffu;
@@ -828,49 +836,50 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
             carry = p >> 16u;
           }
         }
-        for (var l = 0u; l < ml; l = l + 1u) { res[l] = acc[2u * l] | (acc[2u * l + 1u] << 16u); }
+        for (var l = 0u; l < nl; l = l + 1u) { res[l] = acc[2u * l] | (acc[2u * l + 1u] << 16u); }
       }
-      case 9u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); var eq = true; for (var l = 0u; l < ml; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, eq); }
-      case 10u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); var eq = true; for (var l = 0u; l < ml; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, !eq); }
+      case 9u: { var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, eq); }
+      case 10u: { var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, !eq); }
       case 11u: {
-        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
-        var lt = 0u; var done = false; var l = ml;
+        var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane);
+        var lt = 0u; var done = false; var l = ol;
         loop { if (l == 0u) { break; } l = l - 1u; if (!done && x[l] != y[l]) { lt = select(0u, 1u, x[l] < y[l]); done = true; } }
         res[0] = lt;
       }
       case 12u: {
-        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane);
         let sl = (c - 1u) / 32u; let sb = 1u << ((c - 1u) & 31u);
         let xs = (x[sl] & sb) != 0u; let ys = (y[sl] & sb) != 0u;
         if (xs != ys) { res[0] = select(0u, 1u, xs); }
         else {
-          var lt = 0u; var done = false; var l = ml;
+          var lt = 0u; var done = false; var l = ol;
           loop { if (l == 0u) { break; } l = l - 1u; if (!done && x[l] != y[l]) { lt = select(0u, 1u, x[l] < y[l]); done = true; } }
           res[0] = lt;
         }
       }
       case 13u: {
         let cond = (values[(a * ml) * lanes + lane] & 1u) != 0u;
-        var xt = vload_ml(b, ml, lanes, lane); var xf = vload_ml(c, ml, lanes, lane);
-        for (var l = 0u; l < ml; l = l + 1u) { res[l] = select(xf[l], xt[l], cond); }
+        var xt = vload_ml(b, ml, nl, lanes, lane); var xf = vload_ml(c, ml, nl, lanes, lane);
+        for (var l = 0u; l < nl; l = l + 1u) { res[l] = select(xf[l], xt[l], cond); }
       }
       case 14u: {
-        var x = vload_ml(a, ml, lanes, lane);
+        var x = vload_ml(a, ml, ol, lanes, lane); // c = operand width
         let ls = b; let lsh = ls / 32u; let bsh = ls & 31u;
-        for (var l = 0u; l < ml; l = l + 1u) {
+        for (var l = 0u; l < nl; l = l + 1u) {
           let s0 = l + lsh;
           var v = 0u;
-          if (s0 < ml) { v = x[s0] >> bsh; }
-          if (bsh != 0u && s0 + 1u < ml) { v = v | (x[s0 + 1u] << (32u - bsh)); }
+          if (s0 < ol) { v = x[s0] >> bsh; }
+          if (bsh != 0u && s0 + 1u < ol) { v = v | (x[s0 + 1u] << (32u - bsh)); }
           res[l] = v;
         }
       }
-      case 15u, 17u, 18u: { var x = vload_ml(a, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l]; } }
+      case 15u: { var x = vload_ml(a, ml, ol, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
+      case 17u, 18u: { var x = vload_ml(a, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
       case 16u: {
-        var x = vload_ml(a, ml, lanes, lane);
+        var x = vload_ml(a, ml, ol, lanes, lane);
         let sw = c; let sl = (sw - 1u) / 32u; let sb = 1u << ((sw - 1u) & 31u);
         let neg = (x[sl] & sb) != 0u;
-        for (var l = 0u; l < ml; l = l + 1u) {
+        for (var l = 0u; l < nl; l = l + 1u) {
           let lo = l * 32u;
           var v = x[l];
           if (neg) {
@@ -881,12 +890,12 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
       }
       case 19u: {
-        var x = vload_ml(a, ml, lanes, lane);
+        var x = vload_ml(a, ml, nl, lanes, lane);
         for (var l = 0u; l < nl; l = l + 1u) { sig[(f1 + l) * lanes + lane] = x[l] & limb_mask(width, l); }
         is_effect = true;
       }
       case 20u: {
-        var src = vload_ml(a, ml, lanes, lane);
+        var src = vload_ml(a, ml, nl, lanes, lane);
         if (b != 0xffffffffu && reset_on(b, lanes, lane)) { for (var l = 0u; l < nl; l = l + 1u) { src[l] = aux[b + 2u + l]; } }
         for (var l = 0u; l < nl; l = l + 1u) { reg_next[(f1 + l) * lanes + lane] = src[l] & limb_mask(width, l); }
         is_effect = true;
@@ -909,13 +918,13 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
           if (k == 0u) { break; }
           k = k - 1u;
           let vid = aux[a + k * 2u]; let w = aux[a + k * 2u + 1u];
-          var part = vload_ml(vid, ml, lanes, lane);
-          let dl = bitofs / 32u; let dsh = bitofs & 31u;
           let wl = (w + 31u) / 32u;
-          for (var ol = 0u; ol < wl; ol = ol + 1u) {
-            let pm = part[ol] & limb_mask(w, ol);
-            if (dl + ol < ml) { res[dl + ol] = res[dl + ol] | (pm << dsh); }
-            if (dsh != 0u && dl + ol + 1u < ml) { res[dl + ol + 1u] = res[dl + ol + 1u] | (pm >> (32u - dsh)); }
+          var part = vload_ml(vid, ml, wl, lanes, lane);
+          let dl = bitofs / 32u; let dsh = bitofs & 31u;
+          for (var pl = 0u; pl < wl; pl = pl + 1u) {
+            let pm = part[pl] & limb_mask(w, pl);
+            if (dl + pl < nl) { res[dl + pl] = res[dl + pl] | (pm << dsh); }
+            if (dsh != 0u && dl + pl + 1u < nl) { res[dl + pl + 1u] = res[dl + pl + 1u] | (pm >> (32u - dsh)); }
           }
           bitofs = bitofs + w;
         }
@@ -926,7 +935,7 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
       }
       default: {}
     }
-    if (!is_effect) { for (var l = 0u; l < ml; l = l + 1u) { values[(f1 * ml + l) * lanes + lane] = res[l] & limb_mask(width, l); } }
+    if (!is_effect) { for (var l = 0u; l < nl; l = l + 1u) { values[(f1 * ml + l) * lanes + lane] = res[l] & limb_mask(width, l); } }
     r = r + 1u;
   }
 }
