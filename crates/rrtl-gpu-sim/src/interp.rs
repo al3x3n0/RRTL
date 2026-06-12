@@ -661,7 +661,19 @@ fn reset_on(reset_id: u32, lanes: u32, lane: u32) -> bool {
   return bit == 0u;
 }
 
-fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
+fn limb_mask(width: u32, limb: u32) -> u32 {
+  let lo = limb * 32u;
+  if (width <= lo) { return 0u; }
+  if (width >= lo + 32u) { return 0xffffffffu; }
+  return (1u << (width - lo)) - 1u;
+}
+
+fn run_block(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
+  if (ml == 1u) { run_block1(begin, end, lanes, lane); }
+  else { run_block_ml(begin, end, lanes, lane, ml); }
+}
+
+fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
   var r = begin;
   loop {
     if (r >= end) { break; }
@@ -752,6 +764,173 @@ fn run_block(begin: u32, end: u32, lanes: u32, lane: u32) {
   }
 }
 
+// Multi-limb path (ml limbs of 32 bits each, ml in 2..=4). Operands are loaded
+// into fixed local arrays; multiply uses 16-bit half-products (16x16 fits u32).
+fn vload_ml(id: u32, ml: u32, lanes: u32, lane: u32) -> array<u32, 4> {
+  var v = array<u32, 4>(0u, 0u, 0u, 0u);
+  for (var l = 0u; l < ml; l = l + 1u) { v[l] = values[(id * ml + l) * lanes + lane]; }
+  return v;
+}
+
+fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
+  var r = begin;
+  loop {
+    if (r >= end) { break; }
+    let base = r * 6u;
+    let op = code[base];
+    let f1 = code[base + 1u];
+    let width = code[base + 2u];
+    let a = code[base + 3u];
+    let b = code[base + 4u];
+    let c = code[base + 5u];
+    let nl = (width + 31u) / 32u;
+    var res = array<u32, 4>(0u, 0u, 0u, 0u);
+    var is_effect = false;
+
+    switch op {
+      case 0u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = aux[a + l]; } }
+      case 1u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = sig[(a + l) * lanes + lane]; } }
+      case 2u: { var x = vload_ml(a, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = ~x[l]; } }
+      case 3u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] & y[l]; } }
+      case 4u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] | y[l]; } }
+      case 5u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l] ^ y[l]; } }
+      case 6u: {
+        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var carry = 0u;
+        for (var l = 0u; l < ml; l = l + 1u) {
+          let s1 = x[l] + y[l]; let c1 = select(0u, 1u, s1 < x[l]);
+          let s2 = s1 + carry; let c2 = select(0u, 1u, s2 < s1);
+          res[l] = s2; carry = c1 + c2;
+        }
+      }
+      case 7u: {
+        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var borrow = 0u;
+        for (var l = 0u; l < ml; l = l + 1u) {
+          let d1 = x[l] - y[l]; let b1 = select(0u, 1u, x[l] < y[l]);
+          let d2 = d1 - borrow; let b2 = select(0u, 1u, d1 < borrow);
+          res[l] = d2; borrow = b1 + b2;
+        }
+      }
+      case 8u: {
+        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        let halves = ml * 2u;
+        var acc = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+        for (var i = 0u; i < halves; i = i + 1u) {
+          let ai = (x[i / 2u] >> ((i & 1u) * 16u)) & 0xffffu;
+          var carry = 0u;
+          for (var j = 0u; j < halves; j = j + 1u) {
+            let k = i + j;
+            if (k >= halves) { break; }
+            let bj = (y[j / 2u] >> ((j & 1u) * 16u)) & 0xffffu;
+            let p = ai * bj + acc[k] + carry;
+            acc[k] = p & 0xffffu;
+            carry = p >> 16u;
+          }
+        }
+        for (var l = 0u; l < ml; l = l + 1u) { res[l] = acc[2u * l] | (acc[2u * l + 1u] << 16u); }
+      }
+      case 9u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); var eq = true; for (var l = 0u; l < ml; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, eq); }
+      case 10u: { var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane); var eq = true; for (var l = 0u; l < ml; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, !eq); }
+      case 11u: {
+        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        var lt = 0u; var done = false; var l = ml;
+        loop { if (l == 0u) { break; } l = l - 1u; if (!done && x[l] != y[l]) { lt = select(0u, 1u, x[l] < y[l]); done = true; } }
+        res[0] = lt;
+      }
+      case 12u: {
+        var x = vload_ml(a, ml, lanes, lane); var y = vload_ml(b, ml, lanes, lane);
+        let sl = (c - 1u) / 32u; let sb = 1u << ((c - 1u) & 31u);
+        let xs = (x[sl] & sb) != 0u; let ys = (y[sl] & sb) != 0u;
+        if (xs != ys) { res[0] = select(0u, 1u, xs); }
+        else {
+          var lt = 0u; var done = false; var l = ml;
+          loop { if (l == 0u) { break; } l = l - 1u; if (!done && x[l] != y[l]) { lt = select(0u, 1u, x[l] < y[l]); done = true; } }
+          res[0] = lt;
+        }
+      }
+      case 13u: {
+        let cond = (values[(a * ml) * lanes + lane] & 1u) != 0u;
+        var xt = vload_ml(b, ml, lanes, lane); var xf = vload_ml(c, ml, lanes, lane);
+        for (var l = 0u; l < ml; l = l + 1u) { res[l] = select(xf[l], xt[l], cond); }
+      }
+      case 14u: {
+        var x = vload_ml(a, ml, lanes, lane);
+        let ls = b; let lsh = ls / 32u; let bsh = ls & 31u;
+        for (var l = 0u; l < ml; l = l + 1u) {
+          let s0 = l + lsh;
+          var v = 0u;
+          if (s0 < ml) { v = x[s0] >> bsh; }
+          if (bsh != 0u && s0 + 1u < ml) { v = v | (x[s0 + 1u] << (32u - bsh)); }
+          res[l] = v;
+        }
+      }
+      case 15u, 17u, 18u: { var x = vload_ml(a, ml, lanes, lane); for (var l = 0u; l < ml; l = l + 1u) { res[l] = x[l]; } }
+      case 16u: {
+        var x = vload_ml(a, ml, lanes, lane);
+        let sw = c; let sl = (sw - 1u) / 32u; let sb = 1u << ((sw - 1u) & 31u);
+        let neg = (x[sl] & sb) != 0u;
+        for (var l = 0u; l < ml; l = l + 1u) {
+          let lo = l * 32u;
+          var v = x[l];
+          if (neg) {
+            if (lo >= sw) { v = 0xffffffffu; }
+            else if (lo + 32u > sw) { let m = (1u << (sw - lo)) - 1u; v = (v & m) | (~m); }
+          }
+          res[l] = v;
+        }
+      }
+      case 19u: {
+        var x = vload_ml(a, ml, lanes, lane);
+        for (var l = 0u; l < nl; l = l + 1u) { sig[(f1 + l) * lanes + lane] = x[l] & limb_mask(width, l); }
+        is_effect = true;
+      }
+      case 20u: {
+        var src = vload_ml(a, ml, lanes, lane);
+        if (b != 0xffffffffu && reset_on(b, lanes, lane)) { for (var l = 0u; l < nl; l = l + 1u) { src[l] = aux[b + 2u + l]; } }
+        for (var l = 0u; l < nl; l = l + 1u) { reg_next[(f1 + l) * lanes + lane] = src[l] & limb_mask(width, l); }
+        is_effect = true;
+      }
+      case 21u: {
+        let addr = values[(a * ml) * lanes + lane];
+        if (addr < c) { res[0] = mem[(b + addr) * lanes + lane]; }
+        is_effect = false;
+      }
+      case 22u: {
+        let en = values[(a * ml) * lanes + lane] & 1u;
+        let addr = values[(b * ml) * lanes + lane];
+        if (en != 0u && addr < width) { mem[(f1 + addr) * lanes + lane] = values[(c * ml) * lanes + lane]; }
+        is_effect = true;
+      }
+      case 23u: {
+        var bitofs = 0u;
+        var k = b;
+        loop {
+          if (k == 0u) { break; }
+          k = k - 1u;
+          let vid = aux[a + k * 2u]; let w = aux[a + k * 2u + 1u];
+          var part = vload_ml(vid, ml, lanes, lane);
+          let dl = bitofs / 32u; let dsh = bitofs & 31u;
+          let wl = (w + 31u) / 32u;
+          for (var ol = 0u; ol < wl; ol = ol + 1u) {
+            let pm = part[ol] & limb_mask(w, ol);
+            if (dl + ol < ml) { res[dl + ol] = res[dl + ol] | (pm << dsh); }
+            if (dsh != 0u && dl + ol + 1u < ml) { res[dl + ol + 1u] = res[dl + ol + 1u] | (pm >> (32u - dsh)); }
+          }
+          bitofs = bitofs + w;
+        }
+      }
+      case 24u: {
+        if (reset_on(b, lanes, lane)) { for (var l = 0u; l < nl; l = l + 1u) { sig[(f1 + l) * lanes + lane] = aux[b + 2u + l] & limb_mask(width, l); } }
+        is_effect = true;
+      }
+      default: {}
+    }
+    if (!is_effect) { for (var l = 0u; l < ml; l = l + 1u) { values[(f1 * ml + l) * lanes + lane] = res[l] & limb_mask(width, l); } }
+    r = r + 1u;
+  }
+}
+
 @compute @workgroup_size({WG})
 fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let lanes = params[0];
@@ -763,25 +942,29 @@ fn interp_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tnext_b = params[6]; let tnext_e = params[7];
   let commit_b = params[10]; let commit_e = params[11];
   let cap_count = params[12];
+  let ml = params[13];
   // Settle combinational logic once; each cycle then captures, commits, and
   // re-settles. This fuses the otherwise-redundant trailing/leading comb passes
   // (they settle from the same register state) — half the combinational work.
-  run_block(async_b, async_e, lanes, lane);
-  run_block(comb_b, comb_e, lanes, lane);
+  run_block(async_b, async_e, lanes, lane, ml);
+  run_block(comb_b, comb_e, lanes, lane, ml);
   var s = 0u;
   loop {
     if (s >= steps) { break; }
-    run_block(tnext_b, tnext_e, lanes, lane);
-    run_block(commit_b, commit_e, lanes, lane); // tick_commit: memory writes
+    run_block(tnext_b, tnext_e, lanes, lane, ml);
+    run_block(commit_b, commit_e, lanes, lane, ml); // tick_commit: memory writes
     var i = 0u;
     loop {
       if (i >= cap_count) { break; }
-      let off = captured[i];
-      sig[off * lanes + lane] = reg_next[off * lanes + lane];
+      let off = captured[2u * i];
+      let lm = captured[2u * i + 1u];
+      for (var l = 0u; l < lm; l = l + 1u) {
+        sig[(off + l) * lanes + lane] = reg_next[(off + l) * lanes + lane];
+      }
       i = i + 1u;
     }
-    run_block(async_b, async_e, lanes, lane);
-    run_block(comb_b, comb_e, lanes, lane);
+    run_block(async_b, async_e, lanes, lane, ml);
+    run_block(comb_b, comb_e, lanes, lane, ml);
     s = s + 1u;
   }
 }
@@ -827,9 +1010,9 @@ impl InterpGpuSimulator {
         lanes: usize,
         workgroup_size: u32,
     ) -> Result<Self, ErrorReport> {
-        if program.max_limbs != 1 {
+        if program.max_limbs > 4 {
             return Err(interp_error(
-                "GPU interpreter kernel does not yet support multi-limb (>32-bit) values",
+                "GPU interpreter kernel supports values up to 128 bits (4 limbs)",
             ));
         }
         let instance = wgpu::Instance::default();
@@ -864,10 +1047,11 @@ impl InterpGpuSimulator {
             ranges[i * 2] = begin;
             ranges[i * 2 + 1] = end;
         }
-        let captured: Vec<u32> = program
-            .captured_offsets()
+        // Flat [offset, limbs] pairs so commit copies all limbs of each register.
+        let captured_pairs = program.captured_offsets();
+        let captured: Vec<u32> = captured_pairs
             .iter()
-            .map(|&(offset, _)| offset as u32)
+            .flat_map(|&(offset, limbs)| [offset as u32, limbs as u32])
             .collect();
 
         let params: Vec<u32> = vec![
@@ -883,7 +1067,8 @@ impl InterpGpuSimulator {
             ranges[1], // async_e
             ranges[6], // commit_b (unused)
             ranges[7], // commit_e (unused)
-            captured.len() as u32,
+            captured_pairs.len() as u32, // register count
+            program.max_limbs as u32,
         ];
 
         let storage = |label, words: usize, data: Option<&[u32]>| {
@@ -904,7 +1089,7 @@ impl InterpGpuSimulator {
         };
 
         let sig_words = program.total_signal_words * lanes;
-        let value_words = program.num_values * lanes;
+        let value_words = program.num_values * program.max_limbs * lanes;
         let zeros_sig = vec![0u32; sig_words];
         let sig_buffer = storage("interp-sig", sig_words, Some(&zeros_sig));
         let reg_next_buffer = storage("interp-reg-next", sig_words, Some(&zeros_sig));
