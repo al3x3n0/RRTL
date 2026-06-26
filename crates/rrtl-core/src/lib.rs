@@ -5224,8 +5224,9 @@ fn validate_comb_cycles(
             .or_default()
             .extend(assignment_signal_deps(assignment.dst, &assignment.expr));
     }
+    let mut port_dep_cache: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
     for instance in &module.instances {
-        add_instance_comb_deps(design, module, instance, &mut graph);
+        add_instance_comb_deps(design, instance, &mut graph, &mut port_dep_cache);
     }
 
     let mut visiting = HashSet::new();
@@ -5236,6 +5237,21 @@ fn validate_comb_cycles(
                 .signal(signal)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| format!("{:?}", signal.id));
+            if std::env::var("RRTL_DBG_CYCLE").is_ok() {
+                let mut path = Vec::new();
+                let mut on = HashSet::new();
+                find_cycle_path(signal, &graph, &mut path, &mut on);
+                let names: Vec<String> = path
+                    .iter()
+                    .map(|s| {
+                        module
+                            .signal(*s)
+                            .map(|i| i.name.clone())
+                            .unwrap_or_else(|| format!("{:?}", s.id))
+                    })
+                    .collect();
+                eprintln!("CYCLE in {}: {}", module.name, names.join(" -> "));
+            }
             diagnostics.push(
                 Diagnostic::new(
                     "E_COMB_CYCLE",
@@ -5249,42 +5265,134 @@ fn validate_comb_cycles(
     }
 }
 
+/// Add the combinational dependency edges an instance contributes to its
+/// parent's graph. An edge `parent_output → parent_input` is added only when the
+/// child's output port *actually* depends combinationally on that input port
+/// (registered outputs depend on nothing) — so a bidirectional bundle / handshake
+/// between two registered modules no longer false-cycles.
 fn add_instance_comb_deps(
     design: &rrtl_ir::Design,
-    module: &Module,
     instance: &Instance,
     graph: &mut HashMap<Signal, Vec<Signal>>,
+    cache: &mut HashMap<String, HashMap<String, HashSet<String>>>,
 ) {
-    let Some(target) = design.find_module(&instance.module) else {
-        return;
-    };
-    let mut parent_inputs = Vec::new();
-    let mut parent_outputs = Vec::new();
-    for (port_name, parent_signal) in &instance.connections {
-        let Some(port) = target
-            .signals
-            .iter()
-            .find(|signal| signal.name == *port_name)
-        else {
+    let port_deps = module_comb_port_deps(design, &instance.module, cache);
+    // Map this instance's port names to the parent signals they connect to.
+    let conn: HashMap<&str, Signal> = instance
+        .connections
+        .iter()
+        .map(|(name, signal)| (name.as_str(), *signal))
+        .collect();
+    for (out_name, in_names) in &port_deps {
+        let Some(parent_out) = conn.get(out_name.as_str()) else {
             continue;
         };
-        match port.kind {
-            SignalKind::Input if module.signal(*parent_signal).is_some() => {
-                parent_inputs.push(*parent_signal)
+        for in_name in in_names {
+            if let Some(parent_in) = conn.get(in_name.as_str()) {
+                graph.entry(*parent_out).or_default().push(*parent_in);
             }
-            SignalKind::Output if module.signal(*parent_signal).is_some() => {
-                parent_outputs.push(*parent_signal)
+        }
+    }
+}
+
+/// For a module, compute (and memoize) the map `output port name → set of input
+/// port names it combinationally depends on`. Built from the module's own
+/// combinational assignments plus, recursively, the port dependencies of its
+/// child instances. Registered signals are never assignment targets, so a
+/// register-driven output yields an empty dependency set.
+fn module_comb_port_deps(
+    design: &rrtl_ir::Design,
+    module_name: &str,
+    cache: &mut HashMap<String, HashMap<String, HashSet<String>>>,
+) -> HashMap<String, HashSet<String>> {
+    if let Some(cached) = cache.get(module_name) {
+        return cached.clone();
+    }
+    // Insert an empty entry first so a (rejected-elsewhere) hierarchy cycle can't
+    // recurse forever — a revisited module contributes no edges.
+    cache.insert(module_name.to_string(), HashMap::new());
+    let Some(target) = design.find_module(module_name) else {
+        return HashMap::new();
+    };
+
+    // Internal combinational dependency graph over this module's signals.
+    let mut g: HashMap<Signal, Vec<Signal>> = HashMap::new();
+    for assignment in &target.assignments {
+        g.entry(assignment.dst)
+            .or_default()
+            .extend(assignment_signal_deps(assignment.dst, &assignment.expr));
+    }
+    for instance in &target.instances {
+        let sub = module_comb_port_deps(design, &instance.module, cache);
+        let conn: HashMap<&str, Signal> = instance
+            .connections
+            .iter()
+            .map(|(name, signal)| (name.as_str(), *signal))
+            .collect();
+        for (out_name, in_names) in &sub {
+            let Some(child_out) = conn.get(out_name.as_str()) else {
+                continue;
+            };
+            for in_name in in_names {
+                if let Some(child_in) = conn.get(in_name.as_str()) {
+                    g.entry(*child_out).or_default().push(*child_in);
+                }
             }
-            _ => {}
         }
     }
 
-    for output in parent_outputs {
-        graph
-            .entry(output)
-            .or_default()
-            .extend(parent_inputs.iter().copied());
+    // Input port signal → name, to recognize when a DFS reaches an input.
+    let input_names: HashMap<Signal, String> = target
+        .signals
+        .iter()
+        .filter(|s| s.kind == SignalKind::Input)
+        .map(|s| (s.handle, s.name.clone()))
+        .collect();
+
+    let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+    for out in target.signals.iter().filter(|s| s.kind == SignalKind::Output) {
+        let mut reached = HashSet::new();
+        let mut stack = vec![out.handle];
+        let mut seen = HashSet::new();
+        while let Some(node) = stack.pop() {
+            for &dep in g.get(&node).into_iter().flatten() {
+                if let Some(name) = input_names.get(&dep) {
+                    reached.insert(name.clone());
+                }
+                if seen.insert(dep) {
+                    stack.push(dep);
+                }
+            }
+        }
+        if !reached.is_empty() {
+            result.insert(out.name.clone(), reached);
+        }
     }
+
+    cache.insert(module_name.to_string(), result.clone());
+    result
+}
+
+/// Debug helper: find one concrete cycle path starting from `signal` via DFS,
+/// leaving `path` holding the cycle (the repeated node bookends it).
+fn find_cycle_path(
+    signal: Signal,
+    graph: &HashMap<Signal, Vec<Signal>>,
+    path: &mut Vec<Signal>,
+    on: &mut HashSet<Signal>,
+) -> bool {
+    path.push(signal);
+    if !on.insert(signal) {
+        return true; // signal already on path → cycle closed
+    }
+    for dep in graph.get(&signal).into_iter().flatten().copied() {
+        if graph.contains_key(&dep) && find_cycle_path(dep, graph, path, on) {
+            return true;
+        }
+    }
+    on.remove(&signal);
+    path.pop();
+    false
 }
 
 fn has_cycle(
@@ -5935,6 +6043,27 @@ impl<'a> Simulator<'a> {
         Ok(())
     }
 
+    /// Advance one step under an explicit set of clocks that have a rising edge
+    /// this step. Only registers (and memory writes) driven by an `active` clock
+    /// capture their next-state; all others hold. This is the multi-clock
+    /// primitive: a 2:1 domain pair is modelled by listing the fast clock every
+    /// step and the slow clock every other step. With every clock listed it is
+    /// equivalent to [`Self::tick`] (the single-implicit-clock behaviour).
+    ///
+    /// Scope: gates the top module's registers/memory writes. Child-instance
+    /// clock domains are not yet edge-mapped through ports (a follow-up); for a
+    /// flat top module this is exact.
+    pub fn tick_clocked(&mut self, active: &[Signal]) -> Result<(), ErrorReport> {
+        let active: std::collections::HashSet<Signal> = active.iter().copied().collect();
+        self.eval_combinational();
+        self.sample_cover_points(true);
+        self.check_clocked_assertions()?;
+        let tick = self.capture_tick_clocked(&active);
+        self.apply_tick(tick);
+        self.eval_combinational();
+        Ok(())
+    }
+
     pub fn check_assertions(&mut self) -> Result<(), ErrorReport> {
         self.eval_combinational();
         self.sample_cover_points(false);
@@ -6050,6 +6179,62 @@ impl<'a> Simulator<'a> {
             }
         }
 
+        for child in &mut self.children {
+            tick.children.push(child.sim.capture_tick());
+        }
+
+        tick
+    }
+
+    /// Like [`Self::capture_tick`] but captures only registers and memory writes
+    /// whose clock is in `active` (a rising edge this step). Inactive-clock
+    /// registers are omitted from the tick, so `apply_tick` leaves them holding.
+    fn capture_tick_clocked(&mut self, active: &std::collections::HashSet<Signal>) -> TickState {
+        self.drive_child_inputs();
+        for child in &mut self.children {
+            child.sim.eval_combinational();
+        }
+
+        let mut tick = TickState::default();
+        for signal in &self.module.signals {
+            let SignalKind::Reg { clock, reset, next } = &signal.kind else {
+                continue;
+            };
+            // Unclocked registers (no explicit clock) always advance; clocked
+            // ones only on a rising edge of their clock this step.
+            if let Some(clock) = clock {
+                if !active.contains(clock) {
+                    continue;
+                }
+            }
+            let value = if let Some(reset) = reset {
+                if self.reset_asserted(reset) {
+                    encode_value(reset.value, signal.ty)
+                } else {
+                    self.eval_expr(next.as_ref().expect("validated next"))
+                }
+            } else {
+                self.eval_expr(next.as_ref().expect("validated next"))
+            };
+            tick.values.push((signal.handle, value & mask(signal.width)));
+        }
+
+        for write in &self.module.memory_writes {
+            if !active.contains(&write.clock) {
+                continue;
+            }
+            if self.eval_expr(&write.enable) != 0 {
+                let Some(mem) = self.module.signal(write.mem) else {
+                    continue;
+                };
+                let addr = self.eval_expr(&write.addr) as usize;
+                let data = self.eval_expr(&write.data) & mask(mem.width);
+                tick.memories.push((write.mem, addr, data));
+            }
+        }
+
+        // Flat scope: children advance fully (their clocks are not yet mapped
+        // through instance ports).
         for child in &mut self.children {
             tick.children.push(child.sim.capture_tick());
         }
@@ -6646,6 +6831,50 @@ mod tests {
             m.assign(out, count);
         }
         (design, rst, en, out, count)
+    }
+
+    #[test]
+    fn tick_clocked_models_independent_clock_domains() {
+        let mut design = Design::new();
+        let (clka, clkb, a, b);
+        {
+            let mut m = design.module("TwoClock");
+            clka = m.input("clka", 1);
+            clkb = m.input("clkb", 1);
+            let ca = m.reg("countA", 8);
+            let cb = m.reg("countB", 8);
+            m.clock(ca, clka);
+            m.clock(cb, clkb);
+            m.next(ca, ca + lit(1, 8));
+            m.next(cb, cb + lit(1, 8));
+            a = m.output("a", 8);
+            b = m.output("b", 8);
+            m.assign(a, ca);
+            m.assign(b, cb);
+        }
+
+        // clkA edges every step; clkB every other step (half rate).
+        let mut sim = Simulator::new(&design, "TwoClock").unwrap();
+        for step in 0..8 {
+            let mut active = vec![clka];
+            if step % 2 == 1 {
+                active.push(clkb);
+            }
+            sim.tick_clocked(&active).unwrap();
+        }
+        assert_eq!(sim.get(a), 8, "fast domain advances every step");
+        assert_eq!(sim.get(b), 4, "slow domain advances at half rate");
+
+        // Listing both clocks every step is equivalent to the single-clock tick().
+        let mut sim_all = Simulator::new(&design, "TwoClock").unwrap();
+        let mut sim_tick = Simulator::new(&design, "TwoClock").unwrap();
+        for _ in 0..8 {
+            sim_all.tick_clocked(&[clka, clkb]).unwrap();
+            sim_tick.tick();
+        }
+        assert_eq!(sim_all.get(a), sim_tick.get(a));
+        assert_eq!(sim_all.get(b), sim_tick.get(b));
+        assert_eq!(sim_tick.get(b), 8, "plain tick() ignores clocks — both domains advance");
     }
 
     fn req_bundle_type() -> BundleType {

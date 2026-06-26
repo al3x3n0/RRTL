@@ -11,6 +11,7 @@ use rrtl_sim_ir::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod instance_fold;
 pub mod interp;
 pub mod lane_split;
 pub mod work_steal;

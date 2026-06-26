@@ -18,6 +18,7 @@ members = [
     "crates/rrtl-pyrtl",
     "crates/rrtl-surrogate",
     "crates/rrtl-sv-frontend",
+    "crates/rrtl-riscv-asm",
 ]
 resolver = "2"
 

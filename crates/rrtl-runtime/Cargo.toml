@@ -11,6 +11,7 @@ rrtl-gpu-sim = { path = "../rrtl-gpu-sim" }
 rrtl-ir = { path = "../rrtl-ir" }
 rrtl-sim-ir = { path = "../rrtl-sim-ir" }
 rrtl-surrogate = { path = "../rrtl-surrogate" }
+rrtl-sv-frontend = { path = "../rrtl-sv-frontend" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

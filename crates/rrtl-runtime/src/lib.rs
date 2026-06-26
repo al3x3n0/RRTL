@@ -22,6 +22,8 @@ use rrtl_surrogate::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod sv_gpu;
+
 /// Backend kind used by a runtime worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeBackend {

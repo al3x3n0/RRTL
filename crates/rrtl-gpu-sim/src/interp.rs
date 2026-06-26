@@ -59,6 +59,56 @@ pub const OP_CONCAT: u32 = 23;
 /// Effect (async-reset stream): if the reset at aux offset `b` is asserted, set
 /// signal `field1` to that reset's value. Used for asynchronous resets.
 pub const OP_ASYNC_RESET: u32 = 24;
+/// Fused multiply-add: `dst = (a*b + c) & mask`. Produced by encoder fusion of an
+/// `Add(Mul(a,b), c)` whose multiply result is used exactly once, so the product
+/// never round-trips the value buffer. All three operands share the result width.
+pub const OP_MULADD: u32 = 25;
+/// Fused three-input add: `dst = (a + b + c) & mask`. From `Add(Add(a,b), c)`.
+pub const OP_ADD3: u32 = 26;
+/// Fused and-or (AOI): `dst = ((a & b) | c) & mask`. From `Or(And(a,b), c)`.
+pub const OP_ANDOR: u32 = 27;
+/// Fused NAND: `dst = ~(a & b) & mask`. From `Not(And(a,b))` (gate-level).
+pub const OP_NAND: u32 = 28;
+/// Fused NOR: `dst = ~(a | b) & mask`. From `Not(Or(a,b))`.
+pub const OP_NOR: u32 = 29;
+/// Fused XNOR: `dst = ~(a ^ b) & mask`. From `Not(Xor(a,b))`.
+pub const OP_XNOR: u32 = 30;
+/// Fused multiply-subtract: `dst = (a*b - c) & mask`. From `Sub(Mul(a,b), c)`
+/// (the multiply must be the minuend; Sub is not commutative).
+pub const OP_MULSUB: u32 = 31;
+/// Fused three-input xor: `dst = (a ^ b ^ c) & mask`. From `Xor(Xor(a,b), c)`.
+pub const OP_XOR3: u32 = 32;
+/// Fused or-and (OAI): `dst = ((a | b) & c) & mask`. From `And(Or(a,b), c)`.
+pub const OP_ORAND: u32 = 33;
+/// Fused and-or-invert (AOI21 standard cell): `dst = ~((a & b) | c) & mask`. From
+/// the two-level `Not(Or(And(a,b), c))`.
+pub const OP_AOI21: u32 = 34;
+/// Fused or-and-invert (OAI21 standard cell): `dst = ~((a | b) & c) & mask`. From
+/// `Not(And(Or(a,b), c))`.
+pub const OP_OAI21: u32 = 35;
+/// Fused and-or-invert (AOI22 standard cell): `dst = ~((a & b) | (c & d)) & mask`.
+/// From `Not(Or(And(a,b), And(c,d)))`. Operands c and d live in `aux` at the
+/// offset stored in the record's `c` field (the 6-word record holds only a, b).
+pub const OP_AOI22: u32 = 36;
+/// Fused or-and-invert (OAI22 standard cell): `dst = ~((a | b) & (c | d)) & mask`.
+/// From `Not(And(Or(a,b), Or(c,d)))`. c and d live in `aux` (see [`OP_AOI22`]).
+pub const OP_OAI22: u32 = 37;
+
+/// Fused-cone macro-op (the automatic superoptimizer's output). Evaluates a
+/// sub-DAG of simple ops in local registers, writing only the root to the value
+/// buffer — so single-use intermediates never round-trip the (global) value
+/// buffer. Record: `[OP_MACRO, dst, root_width, aux_off, n_sub, 0]`. `aux` holds
+/// `n_sub` 6-word sub-ops `[sub_op, sub_width, ra, rb, rc, imm]`, in topo order;
+/// sub-op `i` writes local reg `i`; the root is reg `n_sub-1`. An operand
+/// `ra/rb/rc` with bit 31 set is a LOCAL register `(r & MACRO_LOCAL_MASK)`, else
+/// a value-buffer id; `imm` carries Slice-lsb / Sext-src-width / Lt-sign-width.
+pub const OP_MACRO: u32 = 38;
+/// Bit 31 of a macro operand ref: set = local register, clear = value-buffer id.
+pub const MACRO_LOCAL: u32 = 0x8000_0000;
+pub const MACRO_LOCAL_MASK: u32 = 0x7fff_ffff;
+/// Max sub-ops per macro (= the interpreter's local register-file size). Larger
+/// cones split across multiple macros.
+pub const MACRO_MAX_SUB: usize = 256;
 
 /// Sentinel reset id (no reset) in an [`OP_CAPTURE_REG`] record's `b` field.
 pub const NO_RESET: u32 = u32::MAX;
@@ -84,9 +134,12 @@ pub enum InterpStream {
 #[derive(Clone, Debug, Default)]
 pub struct InterpProgram {
     pub num_values: usize,
-    /// Max limbs (32-bit words) of any value; the per-lane value workspace
-    /// stores every value zero-extended to this width.
+    /// Max limbs (32-bit words) of any value (1-limb fast path uses ==1).
     pub max_limbs: usize,
+    /// Total packed value-workspace words per lane (sum of each value's limbs).
+    pub total_value_words: usize,
+    /// Offset into `aux` of the per-value-id packed word-offset table.
+    pub value_offsets_base: usize,
     pub total_signal_words: usize,
     pub total_memory_words: usize,
     pub blocks: [Vec<u32>; 4],
@@ -110,7 +163,26 @@ impl InterpProgram {
         Self::encode(&lower_to_machine_program(program))
     }
 
+    /// Like [`encode_design`](Self::encode_design) but first runs the AOT design
+    /// specializer (constant folding, algebraic identities, dead-code
+    /// elimination, value-id compaction). Returns the specialization stats so
+    /// callers can report how much was eliminated.
+    pub fn encode_design_specialized(
+        program: &PackedProgram,
+    ) -> Result<(Self, rrtl_sim_ir::SpecializeStats), ErrorReport> {
+        let machine = lower_to_machine_program(program);
+        let (specialized, stats) = rrtl_sim_ir::specialize_program(&machine);
+        Ok((Self::encode(&specialized)?, stats))
+    }
+
     pub fn encode(machine: &PackedMachineProgram) -> Result<Self, ErrorReport> {
+        Self::encode_opts(machine, true)
+    }
+
+    /// Encode with explicit control over multiply-add fusion. Fusion assumes SSA
+    /// value ids, so it must be disabled when encoding a slot-allocated program
+    /// (where ids are reused across non-overlapping lifetimes).
+    pub fn encode_opts(machine: &PackedMachineProgram, fuse: bool) -> Result<Self, ErrorReport> {
         let source = &machine.source;
         for memory in &source.memories {
             if memory.data_layout.limbs != 1 {
@@ -132,25 +204,40 @@ impl InterpProgram {
         for (index, (slot, block)) in blocks.iter_mut().zip(streams).enumerate() {
             // streams[0] is async_reset_comb, whose register captures are
             // immediate conditional stores rather than next-state captures.
-            *slot = encode_block(block, source, &mut aux, index == 0)?;
+            *slot = encode_block(block, source, &mut aux, index == 0, fuse)?;
         }
         let num_values = streams
             .iter()
             .map(|block| block_value_count(block))
             .max()
             .unwrap_or(0);
-        let max_limbs = streams
+        // Per-value-id limb count = max over blocks (a slot is shared across
+        // blocks). Pack values tightly: voff[v] = cumulative limbs.
+        let mut value_limbs = vec![1usize; num_values];
+        for instr in streams
             .iter()
             .flat_map(|block| block.packets.iter())
             .flat_map(|packet| packet.instrs.iter())
-            .map(|instr| limbs_of(instr.ty.width))
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        {
+            let l = limbs_of(instr.ty.width);
+            if l > value_limbs[instr.dst.0] {
+                value_limbs[instr.dst.0] = l;
+            }
+        }
+        let max_limbs = value_limbs.iter().copied().max().unwrap_or(1).max(1);
+        let mut acc = 0u32;
+        let value_offsets_base = aux.len();
+        for &l in &value_limbs {
+            aux.push(acc);
+            acc += l as u32;
+        }
+        let total_value_words = acc as usize;
 
         Ok(Self {
             num_values,
             max_limbs,
+            total_value_words,
+            value_offsets_base,
             total_signal_words: source.total_signal_words,
             total_memory_words: source.total_memory_words_per_lane,
             blocks,
@@ -160,6 +247,12 @@ impl InterpProgram {
 
     pub fn block(&self, stream: InterpStream) -> &[u32] {
         &self.blocks[stream as usize]
+    }
+
+    /// Total encoded instruction words across all four streams (a proxy for code
+    /// size / shader-independent program size).
+    pub fn total_code_words(&self) -> usize {
+        self.blocks.iter().map(|b| b.len()).sum()
     }
 
     /// Register `(storage_offset, limbs)` captured in tick_next, for commit.
@@ -185,6 +278,35 @@ fn block_value_count(block: &PackedBlock) -> usize {
         .map(|instr| instr.dst.0 + 1)
         .max()
         .unwrap_or(0)
+}
+
+/// Value ids read by an instruction (for fusion use-count analysis).
+fn instr_operand_ids(kind: &PackedInstrKind) -> Vec<usize> {
+    use PackedInstrKind::*;
+    match kind {
+        Lit(_) | Signal(_) => vec![],
+        Not(a) | Zext(a) | Sext(a) | Trunc(a) | Cast(a) | Slice { value: a, .. }
+        | MemRead { addr: a, .. } => vec![a.0],
+        And(a, b) | Or(a, b) | Xor(a, b) | Add(a, b) | Sub(a, b) | Mul(a, b) | Eq(a, b)
+        | Ne(a, b) => vec![a.0, b.0],
+        Lt { lhs, rhs, .. } => vec![lhs.0, rhs.0],
+        Mux {
+            cond,
+            then_value,
+            else_value,
+        } => vec![cond.0, then_value.0, else_value.0],
+        Concat(parts) => parts.iter().map(|p| p.0).collect(),
+    }
+}
+
+fn effect_operand_ids(effect: &PackedEffect) -> Vec<usize> {
+    match effect {
+        PackedEffect::StoreSignal { value, .. } => vec![value.0],
+        PackedEffect::CaptureReg { value, .. } => vec![value.0],
+        PackedEffect::MemoryWrite {
+            enable, addr, data, ..
+        } => vec![enable.0, addr.0, data.0],
+    }
 }
 
 /// Appends a reset entry `[reset_signal_offset, polarity, value_limb0..]` to
@@ -214,12 +336,162 @@ fn encode_block(
     source: &PackedProgram,
     aux: &mut Vec<u32>,
     is_async_reset: bool,
+    fuse: bool,
 ) -> Result<Vec<u32>, ErrorReport> {
     // Pre-pass: width of every value produced in this block, for ops that need a
     // source operand's width (Sext, signed Lt).
-    let mut value_width = vec![0u32; block_value_count(block)];
+    let n = block_value_count(block);
+    let mut value_width = vec![0u32; n];
     for instr in block.packets.iter().flat_map(|p| p.instrs.iter()) {
         value_width[instr.dst.0] = instr.ty.width;
+    }
+
+    // Fusion pre-pass: fold a two-operand op whose inner operand is a matching
+    // single-use op into one fused superoperator, so the inner result never
+    // round-trips the value buffer. Patterns (outer op, inner op) -> fused op:
+    //   Add(Mul(a,b), c) -> MULADD,  Add(Add(a,b), c) -> ADD3,  Or(And(a,b), c) -> ANDOR.
+    // `skip` holds fused-away inner ops; `fused` maps the outer's dst to
+    // (fused_op, a, b, c). MULADD is preferred over ADD3 (the multiply is the
+    // expensive op worth eliminating).
+    let mut use_count = vec![0u32; n];
+    for packet in &block.packets {
+        for instr in &packet.instrs {
+            for id in instr_operand_ids(&instr.kind) {
+                use_count[id] += 1;
+            }
+        }
+        for effect in &packet.effects {
+            for id in effect_operand_ids(effect) {
+                use_count[id] += 1;
+            }
+        }
+    }
+    // inner-op definitions: dst -> (kind_tag, a, b). tag: 0=Mul 1=Add 2=And 3=Or 4=Xor.
+    let mut inner_def: std::collections::HashMap<usize, (u8, u32, u32)> =
+        std::collections::HashMap::new();
+    for instr in block.packets.iter().flat_map(|p| p.instrs.iter()) {
+        let entry = match &instr.kind {
+            PackedInstrKind::Mul(l, r) => Some((0u8, l.0 as u32, r.0 as u32)),
+            PackedInstrKind::Add(l, r) => Some((1u8, l.0 as u32, r.0 as u32)),
+            PackedInstrKind::And(l, r) => Some((2u8, l.0 as u32, r.0 as u32)),
+            PackedInstrKind::Or(l, r) => Some((3u8, l.0 as u32, r.0 as u32)),
+            PackedInstrKind::Xor(l, r) => Some((4u8, l.0 as u32, r.0 as u32)),
+            _ => None,
+        };
+        if let Some(e) = entry {
+            inner_def.insert(instr.dst.0, e);
+        }
+    }
+    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut outer: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut fused: std::collections::HashMap<usize, (u32, u32, u32, u32)> =
+        std::collections::HashMap::new();
+    // Four-operand fused ops (AOI22/OAI22): (fused_op, a, b, c, d). c and d are
+    // emitted into `aux` since the 6-word record holds only a and b.
+    let mut fused4: std::collections::HashMap<usize, (u32, u32, u32, u32, u32)> =
+        std::collections::HashMap::new();
+    if fuse {
+        // Program order: an inner op already chosen as a fused *outer* (it is in
+        // `outer`) must not also be skipped as an inner — each instruction takes
+        // part in at most one fusion.
+        // A value is fusable as an inner only if it is produced exactly once here
+        // and not already claimed by another fusion.
+        let free_inner = |m: usize, skip: &std::collections::HashSet<usize>, outer: &std::collections::HashSet<usize>| {
+            use_count[m] == 1 && !skip.contains(&m) && !outer.contains(&m)
+        };
+        for instr in block.packets.iter().flat_map(|p| p.instrs.iter()) {
+            // `Not` is handled specially: it admits two-level standard-cell fusions
+            // (AOI21 = ~((a&b)|c), OAI21 = ~((a|b)&c)) as well as the one-level
+            // NAND/NOR/XNOR. Try the deeper (more specific) cells first.
+            if let PackedInstrKind::Not(inner) = &instr.kind {
+                let m = inner.0;
+                if !free_inner(m, &skip, &outer) {
+                    continue;
+                }
+                let Some(&(mtag, mx, my)) = inner_def.get(&m) else {
+                    continue;
+                };
+                // Inner Or (mtag 3) -> AOI family; inner And (mtag 2) -> OAI family.
+                //   both operands single-use And/Or -> AOI22/OAI22 ~((a&b)|(c&d))
+                //   one operand single-use And/Or    -> AOI21/OAI21 ~((a&b)|c)
+                //   neither                          -> NOR/NAND
+                // Inner Xor (mtag 4) -> XNOR. Inner Mul/Add (0/1) -> not fusable here.
+                match mtag {
+                    2 | 3 => {
+                        let want = if mtag == 3 { 2u8 } else { 3u8 }; // Or wants And; And wants Or
+                        let (op22, op21, op1) = if mtag == 3 {
+                            (OP_AOI22, OP_AOI21, OP_NOR)
+                        } else {
+                            (OP_OAI22, OP_OAI21, OP_NAND)
+                        };
+                        let gx = if free_inner(mx as usize, &skip, &outer) {
+                            inner_def.get(&(mx as usize)).filter(|d| d.0 == want).copied()
+                        } else {
+                            None
+                        };
+                        let gy = if free_inner(my as usize, &skip, &outer) {
+                            inner_def.get(&(my as usize)).filter(|d| d.0 == want).copied()
+                        } else {
+                            None
+                        };
+                        if let (Some((_, xa, xb)), Some((_, ya, yb))) = (gx, gy) {
+                            fused4.insert(instr.dst.0, (op22, xa, xb, ya, yb));
+                            skip.insert(mx as usize);
+                            skip.insert(my as usize);
+                        } else if let Some((_, xa, xb)) = gx {
+                            fused.insert(instr.dst.0, (op21, xa, xb, my));
+                            skip.insert(mx as usize);
+                        } else if let Some((_, ya, yb)) = gy {
+                            fused.insert(instr.dst.0, (op21, ya, yb, mx));
+                            skip.insert(my as usize);
+                        } else {
+                            fused.insert(instr.dst.0, (op1, mx, my, 0));
+                        }
+                        skip.insert(m);
+                        outer.insert(instr.dst.0);
+                    }
+                    4 => {
+                        fused.insert(instr.dst.0, (OP_XNOR, mx, my, 0));
+                        skip.insert(m);
+                        outer.insert(instr.dst.0);
+                    }
+                    _ => {} // Not(Mul)/Not(Add): leave unfused
+                }
+            }
+        }
+        // Pass B: two-input arithmetic/logic fusions, run AFTER Not-rooted cells
+        // have claimed their inners, so AOI21/OAI21 take priority over the
+        // one-level ANDOR/ORAND that would otherwise grab the same inner Or/And.
+        for instr in block.packets.iter().flat_map(|p| p.instrs.iter()) {
+            // For each outer op: candidate (inner-operand, other-operand) pairs and
+            // a preference-ordered plan of (inner tag, fused opcode). Commutative
+            // outers try both operands as the inner; Sub (non-commutative) only
+            // fuses a multiply that is the minuend.
+            let (cands, plan): (Vec<(usize, usize)>, &[(u8, u32)]) = match &instr.kind {
+                PackedInstrKind::Add(l, r) => {
+                    (vec![(l.0, r.0), (r.0, l.0)], &[(0, OP_MULADD), (1, OP_ADD3)])
+                }
+                PackedInstrKind::Sub(l, r) => (vec![(l.0, r.0)], &[(0, OP_MULSUB)]),
+                PackedInstrKind::Or(l, r) => (vec![(l.0, r.0), (r.0, l.0)], &[(2, OP_ANDOR)]),
+                PackedInstrKind::And(l, r) => (vec![(l.0, r.0), (r.0, l.0)], &[(3, OP_ORAND)]),
+                PackedInstrKind::Xor(l, r) => (vec![(l.0, r.0), (r.0, l.0)], &[(4, OP_XOR3)]),
+                _ => continue,
+            };
+            'outer: for &(want_tag, fop) in plan {
+                for &(m, other) in &cands {
+                    if use_count[m] == 1 && !skip.contains(&m) && !outer.contains(&m) {
+                        if let Some(&(tag, ia, ib)) = inner_def.get(&m) {
+                            if tag == want_tag {
+                                fused.insert(instr.dst.0, (fop, ia, ib, other as u32));
+                                skip.insert(m);
+                                outer.insert(instr.dst.0);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let mut out = Vec::new();
@@ -227,6 +499,20 @@ fn encode_block(
         for instr in &packet.instrs {
             let dst = instr.dst.0 as u32;
             let width = instr.ty.width;
+            if skip.contains(&instr.dst.0) {
+                continue; // inner op fused into a following outer op
+            }
+            if let Some(&(fop, fa, fb, fc, fd)) = fused4.get(&instr.dst.0) {
+                let aux_off = aux.len() as u32;
+                aux.push(fc);
+                aux.push(fd);
+                push_record(&mut out, fop, dst, width, fa, fb, aux_off);
+                continue;
+            }
+            if let Some(&(fop, a, b, c)) = fused.get(&instr.dst.0) {
+                push_record(&mut out, fop, dst, width, a, b, c);
+                continue;
+            }
             let mut rec = |op, a, b, c| push_record(&mut out, op, dst, width, a, b, c);
             match &instr.kind {
                 PackedInstrKind::Lit(words) => {
@@ -356,6 +642,188 @@ fn push_record(out: &mut Vec<u32>, op: u32, field1: u32, width: u32, a: u32, b: 
     out.extend_from_slice(&[op, field1, width, a, b, c]);
 }
 
+/// Simple ops a macro-op can absorb (operands are value refs / per-op immediate;
+/// no `aux`-list, no memory/effect). The automatic fused-superoptimizer's vocabulary.
+fn macro_simple(op: u32) -> bool {
+    matches!(
+        op,
+        OP_NOT | OP_AND | OP_OR | OP_XOR | OP_ADD | OP_SUB | OP_MUL | OP_EQ | OP_NE
+            | OP_LT_U | OP_LT_S | OP_MUX | OP_SLICE | OP_ZEXT | OP_SEXT | OP_TRUNC | OP_CAST
+    )
+}
+
+/// Does this op produce a value (write the value buffer at `field1`)?
+fn produces_value(op: u32) -> bool {
+    !matches!(op, OP_STORE_SIGNAL | OP_CAPTURE_REG | OP_ASYNC_RESET | OP_MEM_WRITE)
+}
+
+/// For a simple op record `[op, dst, w, a, b, c]`: its operand VALUE-IDS (refs
+/// that read the value buffer) and its per-op immediate (Slice lsb / Sext src-w /
+/// Lt sign-w). Padded operand slots are `None`.
+fn simple_operands(op: u32, a: u32, b: u32, c: u32) -> ([Option<u32>; 3], u32) {
+    match op {
+        OP_NOT | OP_ZEXT | OP_TRUNC | OP_CAST => ([Some(a), None, None], 0),
+        OP_SLICE => ([Some(a), None, None], b),  // b = lsb
+        OP_SEXT => ([Some(a), None, None], c),   // c = src width
+        OP_MUX => ([Some(a), Some(b), Some(c)], 0),
+        OP_LT_S => ([Some(a), Some(b), None], c), // c = sign width
+        _ => ([Some(a), Some(b), None], 0),       // AND/OR/XOR/ADD/SUB/MUL/EQ/NE/LT_U
+    }
+}
+
+/// Every value-id READ by a record (for use-counting, so a value read by any
+/// record — incl. effects and `aux`-list ops like Concat — is never inlined).
+fn record_reads(op: u32, a: u32, b: u32, c: u32, aux: &[u32]) -> Vec<u32> {
+    match op {
+        OP_LIT | OP_SIGNAL | OP_ASYNC_RESET => vec![],
+        OP_MEM_READ | OP_STORE_SIGNAL | OP_CAPTURE_REG => vec![a],
+        OP_MEM_WRITE => vec![a, b, c],
+        OP_CONCAT => (0..b).map(|k| aux[(a + k * 2) as usize]).collect(),
+        _ if macro_simple(op) => {
+            let (ops, _) = simple_operands(op, a, b, c);
+            ops.iter().flatten().copied().collect()
+        }
+        // menu-fused / 4-operand cells (only if fusing a menu-encoded stream):
+        _ => vec![a, b, c],
+    }
+}
+
+/// Post-pass that fuses maximal cones of single-use simple ops into `OP_MACRO`
+/// records, so single-use intermediates are kept in macro-local registers
+/// instead of round-tripping the (global) value buffer — the automatic
+/// fused-superoperator. Run on a `fuse=false` (menu-off) encoding. Bit-identical;
+/// reduces the value-buffer-writing record count (the GPU/interp traffic bound).
+pub fn fuse_macros(program: &InterpProgram) -> InterpProgram {
+    use std::collections::HashMap;
+    let mut out = program.clone();
+    let mut aux = program.aux.clone();
+    for bi in 0..4 {
+        let recs = program.blocks[bi].clone();
+        let nrec = recs.len() / RECORD_WORDS;
+        let get = |r: usize, f: usize| recs[r * RECORD_WORDS + f];
+
+        // value-id -> producing record (simple ops only; for inlining/recursion).
+        let mut producer: HashMap<u32, usize> = HashMap::new();
+        for r in 0..nrec {
+            let op = get(r, 0);
+            if macro_simple(op) && produces_value(op) {
+                producer.insert(get(r, 1), r);
+            }
+        }
+        // use-count over every value read by any record, plus the op of the sole
+        // consumer (valid when use_count==1).
+        let mut use_count: HashMap<u32, u32> = HashMap::new();
+        let mut consumer_op: HashMap<u32, u32> = HashMap::new();
+        for r in 0..nrec {
+            let op = get(r, 0);
+            for id in record_reads(op, get(r, 3), get(r, 4), get(r, 5), &aux) {
+                *use_count.entry(id).or_default() += 1;
+                consumer_op.insert(id, op);
+            }
+        }
+        // inlinable: a simple op whose value is used exactly once AND whose sole
+        // consumer is itself a simple op (so it can absorb it). Multi-use values,
+        // and single-use values feeding an effect / aux-list op, stay as records.
+        let inlinable = |dst: u32| -> bool {
+            producer.contains_key(&dst)
+                && use_count.get(&dst).copied().unwrap_or(0) == 1
+                && consumer_op.get(&dst).copied().map(macro_simple).unwrap_or(false)
+        };
+
+        let mut new_recs: Vec<u32> = Vec::with_capacity(recs.len());
+        // root record index -> (dst, width, aux_off, n_sub) of its emitted macro.
+        let mut macros: HashMap<usize, (u32, u32, u32, u32)> = HashMap::new();
+        // record indices inlined into some macro (skip when copying through).
+        let mut inlined: std::collections::HashSet<usize> = Default::default();
+
+        // First pass: decide macro roots = simple ops that are NOT inlinable, and
+        // build each macro by inlining its single-use simple-op operand cones.
+        for r in 0..nrec {
+            let op = get(r, 0);
+            if !(macro_simple(op) && produces_value(op)) || inlinable(get(r, 1)) {
+                continue;
+            }
+            // Build the macro cone rooted at record r.
+            let mut sub: Vec<[u32; 6]> = Vec::new();
+            let mut reg_of: HashMap<u32, u32> = HashMap::new();
+            let mut local_inlined: Vec<usize> = Vec::new();
+            // returns an operand ref for value-id `v` (LOCAL reg if inlined, else value-id).
+            fn inline_val(
+                v: u32,
+                producer: &HashMap<u32, usize>,
+                inlinable: &dyn Fn(u32) -> bool,
+                recs: &[u32],
+                sub: &mut Vec<[u32; 6]>,
+                reg_of: &mut HashMap<u32, u32>,
+                local_inlined: &mut Vec<usize>,
+            ) -> u32 {
+                if let Some(&reg) = reg_of.get(&v) {
+                    return MACRO_LOCAL | reg;
+                }
+                // Cap macro size (the interp uses a fixed local register file); a
+                // larger cone splits — the un-inlined operand stays a normal record
+                // (safe: use_count==1, so it is produced exactly once).
+                if !inlinable(v) || sub.len() >= MACRO_MAX_SUB - 1 {
+                    return v; // external leaf
+                }
+                let rr = producer[&v];
+                let g = |f: usize| recs[rr * RECORD_WORDS + f];
+                let (op, w, a, b, c) = (g(0), g(2), g(3), g(4), g(5));
+                let (ops, imm) = simple_operands(op, a, b, c);
+                let mut refs = [0u32; 3];
+                for (i, o) in ops.iter().enumerate() {
+                    refs[i] = match o {
+                        Some(id) => inline_val(*id, producer, inlinable, recs, sub, reg_of, local_inlined),
+                        None => 0,
+                    };
+                }
+                sub.push([op, w, refs[0], refs[1], refs[2], imm]);
+                let reg = (sub.len() - 1) as u32;
+                reg_of.insert(v, reg);
+                local_inlined.push(rr);
+                MACRO_LOCAL | reg
+            }
+            // Inline the root's operands, then push the root sub-op last.
+            let (op, w, a, b, c) = (get(r, 0), get(r, 2), get(r, 3), get(r, 4), get(r, 5));
+            let (ops, imm) = simple_operands(op, a, b, c);
+            let mut refs = [0u32; 3];
+            for (i, o) in ops.iter().enumerate() {
+                refs[i] = match o {
+                    Some(id) => inline_val(*id, &producer, &inlinable, &recs, &mut sub, &mut reg_of, &mut local_inlined),
+                    None => 0,
+                };
+            }
+            sub.push([op, w, refs[0], refs[1], refs[2], imm]);
+            // Only worth a macro if it actually absorbed ≥1 intermediate.
+            if sub.len() < 2 {
+                continue;
+            }
+            let aux_off = aux.len() as u32;
+            for s in &sub {
+                aux.extend_from_slice(s);
+            }
+            macros.insert(r, (get(r, 1), w, aux_off, sub.len() as u32));
+            for &ri in &local_inlined {
+                inlined.insert(ri);
+            }
+        }
+
+        // Second pass: emit records in order, replacing macro roots and skipping
+        // inlined intermediates.
+        for r in 0..nrec {
+            if let Some(&(dst, w, aux_off, n)) = macros.get(&r) {
+                push_record(&mut new_recs, OP_MACRO, dst, w, aux_off, n, 0);
+            } else if !inlined.contains(&r) {
+                let s = r * RECORD_WORDS;
+                new_recs.extend_from_slice(&recs[s..s + RECORD_WORDS]);
+            }
+        }
+        out.blocks[bi] = new_recs;
+    }
+    out.aux = aux;
+    out
+}
+
 fn mask128(width: u32) -> u128 {
     if width == 0 {
         0
@@ -407,6 +875,18 @@ impl InterpRunner {
         (0..self.lanes)
             .map(|lane| self.storage[offset * self.lanes + lane])
             .collect()
+    }
+
+    /// Loads `words` into a 1-limb memory at `mem_offset` (its `PackedMemory.offset`),
+    /// replicated identically across every lane — e.g. a program image into each
+    /// lane's instruction RAM.
+    pub fn set_memory_replicated(&mut self, mem_offset: usize, words: &[u32]) {
+        for (w, &value) in words.iter().enumerate() {
+            let base = (mem_offset + w) * self.lanes;
+            for lane in 0..self.lanes {
+                self.memories[base + lane] = value;
+            }
+        }
     }
 
     /// Sets a multi-limb signal (`limbs` words at `offset`) from per-lane values.
@@ -485,6 +965,9 @@ impl InterpRunner {
         let lanes = *lanes;
         let aux = &program.aux;
         let recs = program.block(stream);
+        // One reusable macro register file (dense, no per-macro allocation/zeroing —
+        // topo order writes reg `i` before any sub-op reads it).
+        let mut macro_regs = vec![0u128; MACRO_MAX_SUB];
         for record in recs.chunks_exact(RECORD_WORDS) {
             let (op, field1, width) = (record[0], record[1] as usize, record[2]);
             let (a, b, c) = (record[3], record[4], record[5]);
@@ -542,6 +1025,25 @@ impl InterpRunner {
                     OP_ADD => read(a).wrapping_add(read(b)) & mask,
                     OP_SUB => read(a).wrapping_sub(read(b)) & mask,
                     OP_MUL => read(a).wrapping_mul(read(b)) & mask,
+                    OP_MULADD => read(a).wrapping_mul(read(b)).wrapping_add(read(c)) & mask,
+                    OP_ADD3 => read(a).wrapping_add(read(b)).wrapping_add(read(c)) & mask,
+                    OP_ANDOR => ((read(a) & read(b)) | read(c)) & mask,
+                    OP_NAND => !(read(a) & read(b)) & mask,
+                    OP_NOR => !(read(a) | read(b)) & mask,
+                    OP_XNOR => !(read(a) ^ read(b)) & mask,
+                    OP_MULSUB => read(a).wrapping_mul(read(b)).wrapping_sub(read(c)) & mask,
+                    OP_XOR3 => (read(a) ^ read(b) ^ read(c)) & mask,
+                    OP_ORAND => ((read(a) | read(b)) & read(c)) & mask,
+                    OP_AOI21 => !((read(a) & read(b)) | read(c)) & mask,
+                    OP_OAI21 => !((read(a) | read(b)) & read(c)) & mask,
+                    OP_AOI22 => {
+                        let (ci, di) = (aux[c as usize], aux[c as usize + 1]);
+                        !((read(a) & read(b)) | (read(ci) & read(di))) & mask
+                    }
+                    OP_OAI22 => {
+                        let (ci, di) = (aux[c as usize], aux[c as usize + 1]);
+                        !((read(a) | read(b)) & (read(ci) | read(di))) & mask
+                    }
                     OP_EQ => u128::from(read(a) == read(b)),
                     OP_NE => u128::from(read(a) != read(b)),
                     OP_LT_U => u128::from(read(a) < read(b)),
@@ -626,6 +1128,56 @@ impl InterpRunner {
                         }
                         continue;
                     }
+                    OP_MACRO => {
+                        // a = aux offset, b = #sub-ops; evaluate the sub-DAG into
+                        // local regs (no value-buffer round-trip), return the root.
+                        let aux_off = a as usize;
+                        let n = b as usize;
+                        for i in 0..n {
+                            let so = aux_off + i * 6;
+                            let (sop, sw) = (aux[so], aux[so + 1]);
+                            let (ra, rb, rc, imm) = (aux[so + 2], aux[so + 3], aux[so + 4], aux[so + 5]);
+                            let sm = mask128(sw);
+                            // inline reads (no closure → no persistent borrow of macro_regs).
+                            let va = if ra & MACRO_LOCAL != 0 { macro_regs[(ra & MACRO_LOCAL_MASK) as usize] } else { read(ra) };
+                            let vb = if rb & MACRO_LOCAL != 0 { macro_regs[(rb & MACRO_LOCAL_MASK) as usize] } else { read(rb) };
+                            let vc = if rc & MACRO_LOCAL != 0 { macro_regs[(rc & MACRO_LOCAL_MASK) as usize] } else { read(rc) };
+                            macro_regs[i] = match sop {
+                                OP_NOT => !va & sm,
+                                OP_AND => va & vb & sm,
+                                OP_OR => (va | vb) & sm,
+                                OP_XOR => (va ^ vb) & sm,
+                                OP_ADD => va.wrapping_add(vb) & sm,
+                                OP_SUB => va.wrapping_sub(vb) & sm,
+                                OP_MUL => va.wrapping_mul(vb) & sm,
+                                OP_EQ => u128::from(va == vb),
+                                OP_NE => u128::from(va != vb),
+                                OP_LT_U => u128::from(va < vb),
+                                OP_LT_S => {
+                                    let sign = 1u128 << (imm - 1);
+                                    let (ls, rs) = (va & sign != 0, vb & sign != 0);
+                                    u128::from(if ls != rs { ls } else { va < vb })
+                                }
+                                OP_MUX => {
+                                    if va & 1 != 0 {
+                                        vb
+                                    } else {
+                                        vc
+                                    }
+                                }
+                                OP_SLICE => (va >> imm) & sm,
+                                OP_ZEXT | OP_TRUNC | OP_CAST => va & sm,
+                                OP_SEXT => {
+                                    let srcm = mask128(imm);
+                                    let sign = 1u128 << (imm - 1);
+                                    let x = va & srcm;
+                                    (if x & sign != 0 { x | !srcm } else { x }) & sm
+                                }
+                                _ => 0,
+                            };
+                        }
+                        macro_regs[n.saturating_sub(1)]
+                    }
                     _ => unreachable!("unknown interp opcode {op}"),
                 };
                 let base = field1 * ml;
@@ -679,6 +1231,7 @@ fn run_block(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
 
 fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
   var r = begin;
+  var regs: array<u32, 256>;  // macro-op local register file (reused per macro)
   loop {
     if (r >= end) { break; }
     let base = r * 6u;
@@ -701,6 +1254,19 @@ fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
       case 6u: { res = (vget(a, lanes, lane) + vget(b, lanes, lane)) & mask; }
       case 7u: { res = (vget(a, lanes, lane) - vget(b, lanes, lane)) & mask; }
       case 8u: { res = (vget(a, lanes, lane) * vget(b, lanes, lane)) & mask; }
+      case 25u: { res = (vget(a, lanes, lane) * vget(b, lanes, lane) + vget(c, lanes, lane)) & mask; }
+      case 26u: { res = (vget(a, lanes, lane) + vget(b, lanes, lane) + vget(c, lanes, lane)) & mask; }
+      case 27u: { res = ((vget(a, lanes, lane) & vget(b, lanes, lane)) | vget(c, lanes, lane)) & mask; }
+      case 28u: { res = (~(vget(a, lanes, lane) & vget(b, lanes, lane))) & mask; }
+      case 29u: { res = (~(vget(a, lanes, lane) | vget(b, lanes, lane))) & mask; }
+      case 30u: { res = (~(vget(a, lanes, lane) ^ vget(b, lanes, lane))) & mask; }
+      case 31u: { res = (vget(a, lanes, lane) * vget(b, lanes, lane) - vget(c, lanes, lane)) & mask; }
+      case 32u: { res = (vget(a, lanes, lane) ^ vget(b, lanes, lane) ^ vget(c, lanes, lane)) & mask; }
+      case 33u: { res = ((vget(a, lanes, lane) | vget(b, lanes, lane)) & vget(c, lanes, lane)) & mask; }
+      case 34u: { res = (~((vget(a, lanes, lane) & vget(b, lanes, lane)) | vget(c, lanes, lane))) & mask; }
+      case 35u: { res = (~((vget(a, lanes, lane) | vget(b, lanes, lane)) & vget(c, lanes, lane))) & mask; }
+      case 36u: { let ci = aux[c]; let di = aux[c + 1u]; res = (~((vget(a, lanes, lane) & vget(b, lanes, lane)) | (vget(ci, lanes, lane) & vget(di, lanes, lane)))) & mask; }
+      case 37u: { let ci = aux[c]; let di = aux[c + 1u]; res = (~((vget(a, lanes, lane) | vget(b, lanes, lane)) & (vget(ci, lanes, lane) | vget(di, lanes, lane)))) & mask; }
       case 9u: { res = select(0u, 1u, vget(a, lanes, lane) == vget(b, lanes, lane)); }
       case 10u: { res = select(0u, 1u, vget(a, lanes, lane) != vget(b, lanes, lane)); }
       case 11u: { res = select(0u, 1u, vget(a, lanes, lane) < vget(b, lanes, lane)); }
@@ -761,6 +1327,48 @@ fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
         }
         is_effect = true;
       }
+      case 38u: {
+        // OP_MACRO: a = aux offset, b = #sub-ops. Evaluate the sub-DAG into local
+        // regs (no value-buffer round-trip), result = root reg.
+        let n = b;
+        for (var i = 0u; i < n; i = i + 1u) {
+          let so = a + i * 6u;
+          let sop = aux[so];
+          let sm = mask_of(aux[so + 1u]);
+          let ra = aux[so + 2u]; let rb = aux[so + 3u]; let rc = aux[so + 4u]; let imm = aux[so + 5u];
+          let va = select(vget(ra, lanes, lane), regs[ra & 0x7fffffffu], (ra & 0x80000000u) != 0u);
+          let vb = select(vget(rb, lanes, lane), regs[rb & 0x7fffffffu], (rb & 0x80000000u) != 0u);
+          let vc = select(vget(rc, lanes, lane), regs[rc & 0x7fffffffu], (rc & 0x80000000u) != 0u);
+          var rv = 0u;
+          switch sop {
+            case 2u: { rv = (~va) & sm; }
+            case 3u: { rv = (va & vb) & sm; }
+            case 4u: { rv = (va | vb) & sm; }
+            case 5u: { rv = (va ^ vb) & sm; }
+            case 6u: { rv = (va + vb) & sm; }
+            case 7u: { rv = (va - vb) & sm; }
+            case 8u: { rv = (va * vb) & sm; }
+            case 9u: { rv = select(0u, 1u, va == vb); }
+            case 10u: { rv = select(0u, 1u, va != vb); }
+            case 11u: { rv = select(0u, 1u, va < vb); }
+            case 12u: {
+              let sgn = 1u << (imm - 1u);
+              let ls = (va & sgn) != 0u; let rs = (vb & sgn) != 0u;
+              if (ls != rs) { rv = select(0u, 1u, ls); } else { rv = select(0u, 1u, va < vb); }
+            }
+            case 13u: { rv = select(vc, vb, (va & 1u) != 0u); }
+            case 14u: { rv = (va >> imm) & sm; }
+            case 15u, 17u, 18u: { rv = va & sm; }
+            case 16u: {
+              let srcm = mask_of(imm); let sgn = 1u << (imm - 1u); let x = va & srcm;
+              if ((x & sgn) != 0u) { rv = (x | ~srcm) & sm; } else { rv = x & sm; }
+            }
+            default: {}
+          }
+          regs[i] = rv;
+        }
+        res = regs[n - 1u];
+      }
       default: {}
     }
     if (!is_effect) { values[f1 * lanes + lane] = res; }
@@ -773,13 +1381,17 @@ fn run_block1(begin: u32, end: u32, lanes: u32, lane: u32) {
 // ops in a wide-max-limbs design pay only their own width. Multiply uses 16-bit
 // half-products (16x16 fits u32). Slots high limbs stay valid because no op reads
 // past a value's own width.
-fn vload_ml(id: u32, ml: u32, count: u32, lanes: u32, lane: u32) -> array<u32, 4> {
+fn vload_ml(base: u32, count: u32, lanes: u32, lane: u32) -> array<u32, 4> {
   var v = array<u32, 4>(0u, 0u, 0u, 0u);
-  for (var l = 0u; l < count; l = l + 1u) { v[l] = values[(id * ml + l) * lanes + lane]; }
+  for (var l = 0u; l < count; l = l + 1u) { v[l] = values[(base + l) * lanes + lane]; }
   return v;
 }
 
+// Packed scalar load: value-id `id` lives at voff[id] = aux[vb + id].
+fn vget_p(id: u32, vb: u32, lanes: u32, lane: u32) -> u32 { return values[aux[vb + id] * lanes + lane]; }
+
 fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
+  let vb = params[14u];
   var r = begin;
   loop {
     if (r >= end) { break; }
@@ -792,18 +1404,113 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
     let c = code[base + 5u];
     let nl = (width + 31u) / 32u;
     let ol = (c + 31u) / 32u; // operand limbs (ops that set c)
+
+    // 1-limb fast path. Result is 1 limb when nl<=1; operands match result width
+    // for most ops, so nl<=1 suffices. Width-changing ops (eq/ne/slt/sge/slice/
+    // zext/sext) encode operand width in c, so they also require ol<=1.
+    var narrow = nl <= 1u;
+    if (op == 9u || op == 10u || op == 11u || op == 12u || op == 14u || op == 15u || op == 16u) {
+      narrow = narrow && (ol <= 1u);
+    }
+    if (narrow) {
+      let mask = mask_of(width);
+      var sres = 0u;
+      var seff = false;
+      switch op {
+        case 0u: { sres = aux[a] & mask; }
+        case 1u: { sres = sig[a * lanes + lane] & mask; }
+        case 2u: { sres = (~vget_p(a, vb, lanes, lane)) & mask; }
+        case 3u: { sres = (vget_p(a, vb, lanes, lane) & vget_p(b, vb, lanes, lane)) & mask; }
+        case 4u: { sres = (vget_p(a, vb, lanes, lane) | vget_p(b, vb, lanes, lane)) & mask; }
+        case 5u: { sres = (vget_p(a, vb, lanes, lane) ^ vget_p(b, vb, lanes, lane)) & mask; }
+        case 6u: { sres = (vget_p(a, vb, lanes, lane) + vget_p(b, vb, lanes, lane)) & mask; }
+        case 7u: { sres = (vget_p(a, vb, lanes, lane) - vget_p(b, vb, lanes, lane)) & mask; }
+        case 8u: { sres = (vget_p(a, vb, lanes, lane) * vget_p(b, vb, lanes, lane)) & mask; }
+        case 25u: { sres = (vget_p(a, vb, lanes, lane) * vget_p(b, vb, lanes, lane) + vget_p(c, vb, lanes, lane)) & mask; }
+        case 26u: { sres = (vget_p(a, vb, lanes, lane) + vget_p(b, vb, lanes, lane) + vget_p(c, vb, lanes, lane)) & mask; }
+        case 27u: { sres = ((vget_p(a, vb, lanes, lane) & vget_p(b, vb, lanes, lane)) | vget_p(c, vb, lanes, lane)) & mask; }
+        case 28u: { sres = (~(vget_p(a, vb, lanes, lane) & vget_p(b, vb, lanes, lane))) & mask; }
+        case 29u: { sres = (~(vget_p(a, vb, lanes, lane) | vget_p(b, vb, lanes, lane))) & mask; }
+        case 30u: { sres = (~(vget_p(a, vb, lanes, lane) ^ vget_p(b, vb, lanes, lane))) & mask; }
+        case 31u: { sres = (vget_p(a, vb, lanes, lane) * vget_p(b, vb, lanes, lane) - vget_p(c, vb, lanes, lane)) & mask; }
+        case 32u: { sres = (vget_p(a, vb, lanes, lane) ^ vget_p(b, vb, lanes, lane) ^ vget_p(c, vb, lanes, lane)) & mask; }
+        case 33u: { sres = ((vget_p(a, vb, lanes, lane) | vget_p(b, vb, lanes, lane)) & vget_p(c, vb, lanes, lane)) & mask; }
+        case 34u: { sres = (~((vget_p(a, vb, lanes, lane) & vget_p(b, vb, lanes, lane)) | vget_p(c, vb, lanes, lane))) & mask; }
+        case 35u: { sres = (~((vget_p(a, vb, lanes, lane) | vget_p(b, vb, lanes, lane)) & vget_p(c, vb, lanes, lane))) & mask; }
+        case 36u: { let ci = aux[c]; let di = aux[c + 1u]; sres = (~((vget_p(a, vb, lanes, lane) & vget_p(b, vb, lanes, lane)) | (vget_p(ci, vb, lanes, lane) & vget_p(di, vb, lanes, lane)))) & mask; }
+        case 37u: { let ci = aux[c]; let di = aux[c + 1u]; sres = (~((vget_p(a, vb, lanes, lane) | vget_p(b, vb, lanes, lane)) & (vget_p(ci, vb, lanes, lane) | vget_p(di, vb, lanes, lane)))) & mask; }
+        case 9u: { sres = select(0u, 1u, vget_p(a, vb, lanes, lane) == vget_p(b, vb, lanes, lane)); }
+        case 10u: { sres = select(0u, 1u, vget_p(a, vb, lanes, lane) != vget_p(b, vb, lanes, lane)); }
+        case 11u: { sres = select(0u, 1u, vget_p(a, vb, lanes, lane) < vget_p(b, vb, lanes, lane)); }
+        case 12u: {
+          let sign = 1u << (c - 1u);
+          let l = vget_p(a, vb, lanes, lane);
+          let rr = vget_p(b, vb, lanes, lane);
+          let ls = (l & sign) != 0u; let rs = (rr & sign) != 0u;
+          if (ls != rs) { sres = select(0u, 1u, ls); } else { sres = select(0u, 1u, l < rr); }
+        }
+        case 13u: {
+          if ((vget_p(a, vb, lanes, lane) & 1u) != 0u) { sres = vget_p(b, vb, lanes, lane); }
+          else { sres = vget_p(c, vb, lanes, lane); }
+        }
+        case 14u: { sres = (vget_p(a, vb, lanes, lane) >> b) & mask; }
+        case 15u, 17u, 18u: { sres = vget_p(a, vb, lanes, lane) & mask; }
+        case 16u: {
+          let src_mask = mask_of(c);
+          let sign = 1u << (c - 1u);
+          let v = vget_p(a, vb, lanes, lane) & src_mask;
+          if ((v & sign) != 0u) { sres = (v | (~src_mask)) & mask; } else { sres = v & mask; }
+        }
+        case 19u: { sig[f1 * lanes + lane] = vget_p(a, vb, lanes, lane) & mask; seff = true; }
+        case 20u: {
+          var next = vget_p(a, vb, lanes, lane) & mask;
+          if (b != 0xffffffffu && reset_on(b, lanes, lane)) { next = aux[b + 2u] & mask; }
+          reg_next[f1 * lanes + lane] = next; seff = true;
+        }
+        case 21u: {
+          let addr = vget_p(a, vb, lanes, lane);
+          if (addr < c) { sres = mem[(b + addr) * lanes + lane] & mask; } else { sres = 0u; }
+        }
+        case 22u: {
+          let addr = vget_p(b, vb, lanes, lane);
+          if (((vget_p(a, vb, lanes, lane) & 1u) != 0u) && (addr < width)) {
+            mem[(f1 + addr) * lanes + lane] = vget_p(c, vb, lanes, lane);
+          }
+          seff = true;
+        }
+        case 23u: {
+          var result = 0u; var ofs = 0u; var k = b;
+          loop {
+            if (k == 0u) { break; }
+            k = k - 1u;
+            let part = vget_p(aux[a + k * 2u], vb, lanes, lane) & mask_of(aux[a + k * 2u + 1u]);
+            if (ofs < 32u) { result = result | (part << ofs); }
+            ofs = ofs + aux[a + k * 2u + 1u];
+          }
+          sres = result & mask;
+        }
+        case 24u: {
+          if (reset_on(b, lanes, lane)) { sig[f1 * lanes + lane] = aux[b + 2u] & mask; }
+          seff = true;
+        }
+        default: {}
+      }
+      if (!seff) { values[aux[vb + f1] * lanes + lane] = sres; }
+      r = r + 1u; continue;
+    }
+
     var res = array<u32, 4>(0u, 0u, 0u, 0u);
     var is_effect = false;
 
     switch op {
       case 0u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = aux[a + l]; } }
       case 1u: { for (var l = 0u; l < nl; l = l + 1u) { res[l] = sig[(a + l) * lanes + lane]; } }
-      case 2u: { var x = vload_ml(a, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~x[l]; } }
-      case 3u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] & y[l]; } }
-      case 4u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] | y[l]; } }
-      case 5u: { var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] ^ y[l]; } }
+      case 2u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~x[l]; } }
+      case 3u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] & y[l]; } }
+      case 4u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] | y[l]; } }
+      case 5u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] ^ y[l]; } }
       case 6u: {
-        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
         var carry = 0u;
         for (var l = 0u; l < nl; l = l + 1u) {
           let s1 = x[l] + y[l]; let c1 = select(0u, 1u, s1 < x[l]);
@@ -812,7 +1519,7 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
       }
       case 7u: {
-        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
         var borrow = 0u;
         for (var l = 0u; l < nl; l = l + 1u) {
           let d1 = x[l] - y[l]; let b1 = select(0u, 1u, x[l] < y[l]);
@@ -821,7 +1528,7 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
       }
       case 8u: {
-        var x = vload_ml(a, ml, nl, lanes, lane); var y = vload_ml(b, ml, nl, lanes, lane);
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
         let halves = nl * 2u;
         var acc = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
         for (var i = 0u; i < halves; i = i + 1u) {
@@ -838,16 +1545,97 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
         for (var l = 0u; l < nl; l = l + 1u) { res[l] = acc[2u * l] | (acc[2u * l + 1u] << 16u); }
       }
-      case 9u: { var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, eq); }
-      case 10u: { var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, !eq); }
+      case 25u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
+        let halves = nl * 2u;
+        var acc = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+        for (var i = 0u; i < halves; i = i + 1u) {
+          let ai = (x[i / 2u] >> ((i & 1u) * 16u)) & 0xffffu;
+          var carry = 0u;
+          for (var j = 0u; j < halves; j = j + 1u) {
+            let k = i + j;
+            if (k >= halves) { break; }
+            let bj = (y[j / 2u] >> ((j & 1u) * 16u)) & 0xffffu;
+            let p = ai * bj + acc[k] + carry;
+            acc[k] = p & 0xffffu;
+            carry = p >> 16u;
+          }
+        }
+        var z = vload_ml(aux[vb + c], nl, lanes, lane);
+        var carry2 = 0u;
+        for (var l = 0u; l < nl; l = l + 1u) {
+          let prod = acc[2u * l] | (acc[2u * l + 1u] << 16u);
+          let s1 = prod + z[l]; let c1 = select(0u, 1u, s1 < prod);
+          let s2 = s1 + carry2; let c2 = select(0u, 1u, s2 < s1);
+          res[l] = s2; carry2 = c1 + c2;
+        }
+      }
+      case 26u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane);
+        var carry = 0u;
+        for (var l = 0u; l < nl; l = l + 1u) {
+          let s1 = x[l] + y[l]; let c1 = select(0u, 1u, s1 < x[l]);
+          let s2 = s1 + z[l]; let c2 = select(0u, 1u, s2 < s1);
+          let s3 = s2 + carry; let c3 = select(0u, 1u, s3 < s2);
+          res[l] = s3; carry = c1 + c2 + c3;
+        }
+      }
+      case 27u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane);
+        for (var l = 0u; l < nl; l = l + 1u) { res[l] = (x[l] & y[l]) | z[l]; }
+      }
+      case 28u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~(x[l] & y[l]); } }
+      case 29u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~(x[l] | y[l]); } }
+      case 30u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~(x[l] ^ y[l]); } }
+      case 31u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
+        let halves = nl * 2u;
+        var acc = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+        for (var i = 0u; i < halves; i = i + 1u) {
+          let ai = (x[i / 2u] >> ((i & 1u) * 16u)) & 0xffffu;
+          var carry = 0u;
+          for (var j = 0u; j < halves; j = j + 1u) {
+            let k = i + j;
+            if (k >= halves) { break; }
+            let bj = (y[j / 2u] >> ((j & 1u) * 16u)) & 0xffffu;
+            let p = ai * bj + acc[k] + carry;
+            acc[k] = p & 0xffffu;
+            carry = p >> 16u;
+          }
+        }
+        var z = vload_ml(aux[vb + c], nl, lanes, lane);
+        var borrow = 0u;
+        for (var l = 0u; l < nl; l = l + 1u) {
+          let prod = acc[2u * l] | (acc[2u * l + 1u] << 16u);
+          let d1 = prod - z[l]; let b1 = select(0u, 1u, prod < z[l]);
+          let d2 = d1 - borrow; let b2 = select(0u, 1u, d1 < borrow);
+          res[l] = d2; borrow = b1 + b2;
+        }
+      }
+      case 32u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l] ^ y[l] ^ z[l]; } }
+      case 33u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = (x[l] | y[l]) & z[l]; } }
+      case 34u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~((x[l] & y[l]) | z[l]); } }
+      case 35u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane); var z = vload_ml(aux[vb + c], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~((x[l] | y[l]) & z[l]); } }
+      case 36u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
+        var z = vload_ml(aux[vb + aux[c]], nl, lanes, lane); var w2 = vload_ml(aux[vb + aux[c + 1u]], nl, lanes, lane);
+        for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~((x[l] & y[l]) | (z[l] & w2[l])); }
+      }
+      case 37u: {
+        var x = vload_ml(aux[vb + a], nl, lanes, lane); var y = vload_ml(aux[vb + b], nl, lanes, lane);
+        var z = vload_ml(aux[vb + aux[c]], nl, lanes, lane); var w2 = vload_ml(aux[vb + aux[c + 1u]], nl, lanes, lane);
+        for (var l = 0u; l < nl; l = l + 1u) { res[l] = ~((x[l] | y[l]) & (z[l] | w2[l])); }
+      }
+      case 9u: { var x = vload_ml(aux[vb + a], ol, lanes, lane); var y = vload_ml(aux[vb + b], ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, eq); }
+      case 10u: { var x = vload_ml(aux[vb + a], ol, lanes, lane); var y = vload_ml(aux[vb + b], ol, lanes, lane); var eq = true; for (var l = 0u; l < ol; l = l + 1u) { if (x[l] != y[l]) { eq = false; } } res[0] = select(0u, 1u, !eq); }
       case 11u: {
-        var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane);
+        var x = vload_ml(aux[vb + a], ol, lanes, lane); var y = vload_ml(aux[vb + b], ol, lanes, lane);
         var lt = 0u; var done = false; var l = ol;
         loop { if (l == 0u) { break; } l = l - 1u; if (!done && x[l] != y[l]) { lt = select(0u, 1u, x[l] < y[l]); done = true; } }
         res[0] = lt;
       }
       case 12u: {
-        var x = vload_ml(a, ml, ol, lanes, lane); var y = vload_ml(b, ml, ol, lanes, lane);
+        var x = vload_ml(aux[vb + a], ol, lanes, lane); var y = vload_ml(aux[vb + b], ol, lanes, lane);
         let sl = (c - 1u) / 32u; let sb = 1u << ((c - 1u) & 31u);
         let xs = (x[sl] & sb) != 0u; let ys = (y[sl] & sb) != 0u;
         if (xs != ys) { res[0] = select(0u, 1u, xs); }
@@ -858,12 +1646,12 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
       }
       case 13u: {
-        let cond = (values[(a * ml) * lanes + lane] & 1u) != 0u;
-        var xt = vload_ml(b, ml, nl, lanes, lane); var xf = vload_ml(c, ml, nl, lanes, lane);
+        let cond = (values[aux[vb + a] * lanes + lane] & 1u) != 0u;
+        var xt = vload_ml(aux[vb + b], nl, lanes, lane); var xf = vload_ml(aux[vb + c], nl, lanes, lane);
         for (var l = 0u; l < nl; l = l + 1u) { res[l] = select(xf[l], xt[l], cond); }
       }
       case 14u: {
-        var x = vload_ml(a, ml, ol, lanes, lane); // c = operand width
+        var x = vload_ml(aux[vb + a], ol, lanes, lane); // c = operand width
         let ls = b; let lsh = ls / 32u; let bsh = ls & 31u;
         for (var l = 0u; l < nl; l = l + 1u) {
           let s0 = l + lsh;
@@ -873,10 +1661,10 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
           res[l] = v;
         }
       }
-      case 15u: { var x = vload_ml(a, ml, ol, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
-      case 17u, 18u: { var x = vload_ml(a, ml, nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
+      case 15u: { var x = vload_ml(aux[vb + a], ol, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
+      case 17u, 18u: { var x = vload_ml(aux[vb + a], nl, lanes, lane); for (var l = 0u; l < nl; l = l + 1u) { res[l] = x[l]; } }
       case 16u: {
-        var x = vload_ml(a, ml, ol, lanes, lane);
+        var x = vload_ml(aux[vb + a], ol, lanes, lane);
         let sw = c; let sl = (sw - 1u) / 32u; let sb = 1u << ((sw - 1u) & 31u);
         let neg = (x[sl] & sb) != 0u;
         for (var l = 0u; l < nl; l = l + 1u) {
@@ -890,25 +1678,25 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
         }
       }
       case 19u: {
-        var x = vload_ml(a, ml, nl, lanes, lane);
+        var x = vload_ml(aux[vb + a], nl, lanes, lane);
         for (var l = 0u; l < nl; l = l + 1u) { sig[(f1 + l) * lanes + lane] = x[l] & limb_mask(width, l); }
         is_effect = true;
       }
       case 20u: {
-        var src = vload_ml(a, ml, nl, lanes, lane);
+        var src = vload_ml(aux[vb + a], nl, lanes, lane);
         if (b != 0xffffffffu && reset_on(b, lanes, lane)) { for (var l = 0u; l < nl; l = l + 1u) { src[l] = aux[b + 2u + l]; } }
         for (var l = 0u; l < nl; l = l + 1u) { reg_next[(f1 + l) * lanes + lane] = src[l] & limb_mask(width, l); }
         is_effect = true;
       }
       case 21u: {
-        let addr = values[(a * ml) * lanes + lane];
+        let addr = values[aux[vb + a] * lanes + lane];
         if (addr < c) { res[0] = mem[(b + addr) * lanes + lane]; }
         is_effect = false;
       }
       case 22u: {
-        let en = values[(a * ml) * lanes + lane] & 1u;
-        let addr = values[(b * ml) * lanes + lane];
-        if (en != 0u && addr < width) { mem[(f1 + addr) * lanes + lane] = values[(c * ml) * lanes + lane]; }
+        let en = values[aux[vb + a] * lanes + lane] & 1u;
+        let addr = values[aux[vb + b] * lanes + lane];
+        if (en != 0u && addr < width) { mem[(f1 + addr) * lanes + lane] = values[aux[vb + c] * lanes + lane]; }
         is_effect = true;
       }
       case 23u: {
@@ -919,7 +1707,7 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
           k = k - 1u;
           let vid = aux[a + k * 2u]; let w = aux[a + k * 2u + 1u];
           let wl = (w + 31u) / 32u;
-          var part = vload_ml(vid, ml, wl, lanes, lane);
+          var part = vload_ml(aux[vb + vid], wl, lanes, lane);
           let dl = bitofs / 32u; let dsh = bitofs & 31u;
           for (var pl = 0u; pl < wl; pl = pl + 1u) {
             let pm = part[pl] & limb_mask(w, pl);
@@ -935,7 +1723,7 @@ fn run_block_ml(begin: u32, end: u32, lanes: u32, lane: u32, ml: u32) {
       }
       default: {}
     }
-    if (!is_effect) { for (var l = 0u; l < nl; l = l + 1u) { values[(f1 * ml + l) * lanes + lane] = res[l] & limb_mask(width, l); } }
+    if (!is_effect) { for (var l = 0u; l < nl; l = l + 1u) { values[(aux[vb + f1] + l) * lanes + lane] = res[l] & limb_mask(width, l); } }
     r = r + 1u;
   }
 }
@@ -1078,6 +1866,7 @@ impl InterpGpuSimulator {
             ranges[7], // commit_e (unused)
             captured_pairs.len() as u32, // register count
             program.max_limbs as u32,
+            program.value_offsets_base as u32, // params[14]: aux base of voff table
         ];
 
         let storage = |label, words: usize, data: Option<&[u32]>| {
@@ -1098,7 +1887,7 @@ impl InterpGpuSimulator {
         };
 
         let sig_words = program.total_signal_words * lanes;
-        let value_words = program.num_values * program.max_limbs * lanes;
+        let value_words = program.total_value_words * lanes;
         let zeros_sig = vec![0u32; sig_words];
         let sig_buffer = storage("interp-sig", sig_words, Some(&zeros_sig));
         let reg_next_buffer = storage("interp-reg-next", sig_words, Some(&zeros_sig));
@@ -1208,6 +1997,23 @@ impl InterpGpuSimulator {
             &self.sig_buffer,
             (offset * self.lanes * 4) as u64,
             bytemuck::cast_slice(lane_values),
+        );
+    }
+
+    /// Loads `words` into a 1-limb memory at `mem_offset` (its `PackedMemory.offset`),
+    /// replicated identically across every lane (a program image into each lane's RAM).
+    pub fn set_memory_replicated(&self, mem_offset: usize, words: &[u32]) {
+        // Memory is word-major like signals: word w of lane l is at (mem_offset+w)*lanes+l.
+        let mut region = vec![0u32; words.len() * self.lanes];
+        for (w, &value) in words.iter().enumerate() {
+            for lane in 0..self.lanes {
+                region[w * self.lanes + lane] = value;
+            }
+        }
+        self.queue.write_buffer(
+            &self.mem_buffer,
+            (mem_offset * self.lanes * 4) as u64,
+            bytemuck::cast_slice(&region),
         );
     }
 
@@ -1328,6 +2134,359 @@ mod tests {
             let r_flag = runner.get_signal(offset(flag_out));
             let c_flag: Vec<u32> = cpu.get_signal(flag_out).unwrap().iter().map(|&v| v as u32).collect();
             assert_eq!(r_flag, c_flag, "flag mismatch at cycle {cycle}");
+        }
+    }
+
+    /// Specialization (const-fold + identities + DCE + compaction) must produce
+    /// a program that is bit-for-bit equivalent to the original, and must reduce
+    /// the instruction count on a design rich in foldable constants.
+    #[test]
+    fn specialized_program_matches_original() {
+        use rrtl_sim_ir::specialize_program;
+
+        let mut design = Design::new();
+        let (clk, din, din64, o32, o64);
+        {
+            let mut m = design.module("Spec");
+            clk = m.input("clk", uint(1));
+            din = m.input("din", uint(32));
+            din64 = m.input("din64", uint(64));
+            // (100 + 23) * 1 -> 123  (full fold + mul-by-one copy)
+            let k = m.wire("k", uint(32));
+            m.assign(k, (lit_u(100, 32) + lit_u(23, 32)) * lit_u(1, 32));
+            // din | 0 -> din  (identity copy)
+            let passthru = m.wire("passthru", uint(32));
+            m.assign(passthru, din | lit_u(0, 32));
+            // surviving signal-dependent work: acc' = acc*C + k + passthru
+            let acc = m.reg("acc", uint(32));
+            m.clock(acc, clk);
+            m.next(acc, acc * lit_u(0x9e37_79b9, 32) + k + passthru);
+            o32 = m.output("o32", uint(32));
+            m.assign(o32, acc);
+            // 64-bit constant fold: 0x1_0000_0000 + 5 -> 0x1_0000_0005 (2 limbs)
+            let big = m.reg("big", uint(64));
+            m.clock(big, clk);
+            m.next(big, big + (lit_u(0x1_0000_0000, 64) + lit_u(5, 64)) + din64);
+            o64 = m.output("o64", uint(64));
+            m.assign(o64, big);
+        }
+
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Spec").unwrap();
+        let machine = lower_to_machine_program(&program);
+        let (spec, stats) = specialize_program(&machine);
+        assert!(
+            stats.instrs_after < stats.instrs_before,
+            "expected fewer instructions after specialization: {stats:?}"
+        );
+        assert!(stats.folded > 0 && stats.copies > 0, "{stats:?}");
+
+        let offset = |sig: rrtl_ir::Signal| {
+            program.signals[program.signal_index(sig).unwrap()].layout.offset
+        };
+        let lanes = 6;
+        let mut orig = InterpRunner::new(InterpProgram::encode(&machine).unwrap(), lanes);
+        let mut opt = InterpRunner::new(InterpProgram::encode(&spec).unwrap(), lanes);
+        for r in [&mut orig, &mut opt] {
+            r.set_signal(offset(clk), &vec![1u32; lanes]);
+        }
+
+        for cycle in 0..12u32 {
+            let din_v: Vec<u32> = (0..lanes as u32)
+                .map(|l| cycle.wrapping_mul(2654435761).wrapping_add(l * 13))
+                .collect();
+            let din64_v: Vec<u128> = (0..lanes as u128)
+                .map(|l| l.wrapping_mul(0x1234_5678_9abc).wrapping_add(cycle as u128))
+                .collect();
+            for r in [&mut orig, &mut opt] {
+                r.set_signal(offset(din), &din_v);
+                r.set_signal_wide(offset(din64), 2, &din64_v);
+                r.tick();
+            }
+            assert_eq!(
+                orig.get_signal(offset(o32)),
+                opt.get_signal(offset(o32)),
+                "o32 mismatch at cycle {cycle}"
+            );
+            assert_eq!(
+                orig.get_signal_wide(offset(o64), 2),
+                opt.get_signal_wide(offset(o64), 2),
+                "o64 mismatch at cycle {cycle}"
+            );
+        }
+    }
+
+    /// Fused superoperators (Add3, AndOr) plus a wide 64-bit path must match the
+    /// independent SimdCpuSimulator engine.
+    #[test]
+    fn fused_ops_match_simd_cpu() {
+        let mut design = Design::new();
+        let (clk, din, e, f, g, sum_o, aoi_o, wide_o);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            din = m.input("din", uint(32));
+            e = m.input("e", uint(32));
+            f = m.input("f", uint(32));
+            g = m.input("g", uint(32));
+            // adder chain -> Add3 fusion
+            let sum = m.reg("sum", uint(32));
+            m.clock(sum, clk);
+            m.next(sum, sum + din + e + f);
+            sum_o = m.output("sum_o", uint(32));
+            m.assign(sum_o, sum);
+            // (din & e) | (f & g) -> AndOr fusion
+            let aoi = m.reg("aoi", uint(32));
+            m.clock(aoi, clk);
+            m.next(aoi, (din & e) | (f & g));
+            aoi_o = m.output("aoi_o", uint(32));
+            m.assign(aoi_o, aoi);
+            // 64-bit adder chain -> wide Add3 path
+            let wide = m.reg("wide", uint(64));
+            m.clock(wide, clk);
+            let din64 = m.input("din64", uint(64));
+            m.next(wide, wide + din64 + lit_u(0x1_0000_0001, 64));
+            wide_o = m.output("wide_o", uint(64));
+            m.assign(wide_o, wide);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let din64 = compiled
+            .find_module("Top")
+            .and_then(|mm| mm.signals.iter().find(|s| s.name == "din64"))
+            .map(|s| s.handle)
+            .unwrap();
+
+        let lanes = 5;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+
+        for cycle in 0..10u32 {
+            let v = |base: u32| -> Vec<u32> {
+                (0..lanes as u32).map(|l| base.wrapping_mul(2654435761).wrapping_add(l * 7 + cycle)).collect()
+            };
+            for (s, base) in [(din, 1u32), (e, 2), (f, 3), (g, 4)] {
+                let val = v(base);
+                runner.set_signal(off(s), &val);
+                cpu.set_signal(s, &val.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+            }
+            let w64: Vec<u128> = (0..lanes as u128).map(|l| l.wrapping_mul(0x1_0000_0007).wrapping_add(cycle as u128)).collect();
+            runner.set_signal_wide(off(din64), 2, &w64);
+            cpu.set_signal(din64, &w64).unwrap();
+
+            runner.tick();
+            cpu.tick();
+
+            for s in [sum_o, aoi_o] {
+                let r: Vec<u32> = runner.get_signal(off(s));
+                let c: Vec<u32> = cpu.get_signal(s).unwrap().iter().map(|&x| x as u32).collect();
+                assert_eq!(r, c, "{s:?} mismatch at cycle {cycle}");
+            }
+            let rw = runner.get_signal_wide(off(wide_o), 2);
+            let cw = cpu.get_signal(wide_o).unwrap();
+            assert_eq!(rw, cw, "wide_o mismatch at cycle {cycle}");
+        }
+    }
+
+    /// The extended fused menu (NAND/NOR/XNOR, MulSub, Xor3, OrAnd), including
+    /// wide 64-bit paths, must match the independent SimdCpuSimulator.
+    #[test]
+    fn extended_fused_ops_match_simd_cpu() {
+        let mut design = Design::new();
+        let (clk, a, b, c, a64, b64, c64);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            a = m.input("a", uint(32));
+            b = m.input("b", uint(32));
+            c = m.input("c", uint(32));
+            a64 = m.input("a64", uint(64));
+            b64 = m.input("b64", uint(64));
+            c64 = m.input("c64", uint(64));
+            let mut reg_eq = |name: &str, expr: rrtl_core::Expr| {
+                let r = m.reg(name, uint(32));
+                m.clock(r, clk);
+                m.next(r, expr);
+                let o = m.output(format!("{name}_o"), uint(32));
+                m.assign(o, r);
+            };
+            reg_eq("nand", !(a & b));
+            reg_eq("nor", !(a | b));
+            reg_eq("xnor", !(a ^ b));
+            reg_eq("msub", a * b - c);
+            reg_eq("xor3", a ^ b ^ c);
+            reg_eq("orand", (a | b) & c);
+            // wide 64-bit MulSub + Xor3
+            let mut wreg = |name: &str, expr: rrtl_core::Expr| {
+                let r = m.reg(name, uint(64));
+                m.clock(r, clk);
+                m.next(r, expr);
+                let o = m.output(format!("{name}_o"), uint(64));
+                m.assign(o, r);
+            };
+            wreg("wmsub", a64 * b64 - c64);
+            wreg("wxor3", a64 ^ b64 ^ c64);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let handle = |name: &str| compiled.find_module("Top").unwrap().signals.iter().find(|s| s.name == name).unwrap().handle;
+
+        let lanes = 5;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+
+        for cycle in 0..8u32 {
+            for (s, base) in [(a, 1u32), (b, 2), (c, 3)] {
+                let v: Vec<u32> = (0..lanes as u32).map(|l| base.wrapping_mul(2654435761).wrapping_add(l * 5 + cycle)).collect();
+                runner.set_signal(off(s), &v);
+                cpu.set_signal(s, &v.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+            }
+            for (s, base) in [(a64, 7u128), (b64, 11), (c64, 13)] {
+                let v: Vec<u128> = (0..lanes as u128).map(|l| l.wrapping_mul(base.wrapping_mul(0x1_0000_0007)).wrapping_add(cycle as u128)).collect();
+                runner.set_signal_wide(off(s), 2, &v);
+                cpu.set_signal(s, &v).unwrap();
+            }
+            runner.tick();
+            cpu.tick();
+            for name in ["nand", "nor", "xnor", "msub", "xor3", "orand"] {
+                let h = handle(&format!("{name}_o"));
+                let r = runner.get_signal(off(h));
+                let cc: Vec<u32> = cpu.get_signal(h).unwrap().iter().map(|&x| x as u32).collect();
+                assert_eq!(r, cc, "{name} mismatch at cycle {cycle}");
+            }
+            for name in ["wmsub", "wxor3"] {
+                let h = handle(&format!("{name}_o"));
+                assert_eq!(runner.get_signal_wide(off(h), 2), cpu.get_signal(h).unwrap(), "{name} mismatch at cycle {cycle}");
+            }
+        }
+    }
+
+    /// Two-level standard-cell fusions (AOI21 = ~((a&b)|c), OAI21 = ~((a|b)&c))
+    /// must match SimdCpuSimulator, and must not corrupt nearby one-level gates.
+    #[test]
+    fn aoi_oai_match_simd_cpu() {
+        let mut design = Design::new();
+        let (clk, a, b, c);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            a = m.input("a", uint(32));
+            b = m.input("b", uint(32));
+            c = m.input("c", uint(32));
+            let mut reg_eq = |name: &str, expr: rrtl_core::Expr| {
+                let r = m.reg(name, uint(32));
+                m.clock(r, clk);
+                m.next(r, expr);
+                let o = m.output(format!("{name}_o"), uint(32));
+                m.assign(o, r);
+            };
+            reg_eq("aoi", !((a & b) | c)); // AOI21
+            reg_eq("oai", !((a | b) & c)); // OAI21
+            // one-level gate adjacent, to confirm the deeper match doesn't steal it
+            reg_eq("nand", !(a & b));
+            reg_eq("plainor", (a & b) | c); // ANDOR (no invert)
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let handle = |name: &str| compiled.find_module("Top").unwrap().signals.iter().find(|s| s.name == name).unwrap().handle;
+
+        let lanes = 5;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+        for cycle in 0..8u32 {
+            for (s, base) in [(a, 1u32), (b, 2), (c, 3)] {
+                let v: Vec<u32> = (0..lanes as u32).map(|l| base.wrapping_mul(2654435761).wrapping_add(l * 5 + cycle)).collect();
+                runner.set_signal(off(s), &v);
+                cpu.set_signal(s, &v.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+            }
+            runner.tick();
+            cpu.tick();
+            for name in ["aoi", "oai", "nand", "plainor"] {
+                let h = handle(&format!("{name}_o"));
+                let r = runner.get_signal(off(h));
+                let cc: Vec<u32> = cpu.get_signal(h).unwrap().iter().map(|&x| x as u32).collect();
+                assert_eq!(r, cc, "{name} mismatch at cycle {cycle}");
+            }
+        }
+    }
+
+    /// Four-operand standard cells AOI22 = ~((a&b)|(c&d)) and OAI22 = ~((a|b)&(c|d)),
+    /// whose 3rd/4th operands live in aux, must match SimdCpuSimulator (incl. a wide
+    /// 64-bit instance), and must not disturb adjacent 2- and 3-operand cells.
+    #[test]
+    fn aoi22_oai22_match_simd_cpu() {
+        let mut design = Design::new();
+        let (clk, a, b, c, d, a64, b64, c64, d64);
+        {
+            let mut m = design.module("Top");
+            clk = m.input("clk", uint(1));
+            a = m.input("a", uint(32));
+            b = m.input("b", uint(32));
+            c = m.input("c", uint(32));
+            d = m.input("d", uint(32));
+            a64 = m.input("a64", uint(64));
+            b64 = m.input("b64", uint(64));
+            c64 = m.input("c64", uint(64));
+            d64 = m.input("d64", uint(64));
+            let mut r32 = |name: &str, e: rrtl_core::Expr| {
+                let r = m.reg(name, uint(32));
+                m.clock(r, clk);
+                m.next(r, e);
+                let o = m.output(format!("{name}_o"), uint(32));
+                m.assign(o, r);
+            };
+            r32("aoi22", !((a & b) | (c & d)));
+            r32("oai22", !((a | b) & (c | d)));
+            r32("aoi21", !((a & b) | c)); // 3-op neighbour
+            r32("nand", !(a & b)); // 2-op neighbour
+            let mut r64 = |name: &str, e: rrtl_core::Expr| {
+                let r = m.reg(name, uint(64));
+                m.clock(r, clk);
+                m.next(r, e);
+                let o = m.output(format!("{name}_o"), uint(64));
+                m.assign(o, r);
+            };
+            r64("waoi22", !((a64 & b64) | (c64 & d64)));
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Top").unwrap();
+        let off = |s: rrtl_ir::Signal| program.signals[program.signal_index(s).unwrap()].layout.offset;
+        let h = |name: &str| compiled.find_module("Top").unwrap().signals.iter().find(|s| s.name == name).unwrap().handle;
+        let lanes = 5;
+        let mut runner = InterpRunner::new(InterpProgram::encode_design(&program).unwrap(), lanes);
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        runner.set_signal(off(clk), &vec![1u32; lanes]);
+        cpu.set_signal(clk, &vec![1u128; lanes]).unwrap();
+        for cycle in 0..8u32 {
+            for (s, base) in [(a, 1u32), (b, 2), (c, 3), (d, 4)] {
+                let v: Vec<u32> = (0..lanes as u32).map(|l| base.wrapping_mul(2654435761).wrapping_add(l * 5 + cycle)).collect();
+                runner.set_signal(off(s), &v);
+                cpu.set_signal(s, &v.iter().map(|&x| x as u128).collect::<Vec<_>>()).unwrap();
+            }
+            for (s, base) in [(a64, 7u128), (b64, 11), (c64, 13), (d64, 17)] {
+                let v: Vec<u128> = (0..lanes as u128).map(|l| l.wrapping_mul(base.wrapping_mul(0x1_0000_0007)).wrapping_add(cycle as u128)).collect();
+                runner.set_signal_wide(off(s), 2, &v);
+                cpu.set_signal(s, &v).unwrap();
+            }
+            runner.tick();
+            cpu.tick();
+            for name in ["aoi22", "oai22", "aoi21", "nand"] {
+                let hh = h(&format!("{name}_o"));
+                let r = runner.get_signal(off(hh));
+                let cc: Vec<u32> = cpu.get_signal(hh).unwrap().iter().map(|&x| x as u32).collect();
+                assert_eq!(r, cc, "{name} mismatch at cycle {cycle}");
+            }
+            let hw = h("waoi22_o");
+            assert_eq!(runner.get_signal_wide(off(hw), 2), cpu.get_signal(hw).unwrap(), "waoi22 mismatch at cycle {cycle}");
         }
     }
 

@@ -2,3 +2,10 @@ target/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Verilator / C build artifacts from the bench harnesses
+obj_dir/
+obj_dir_b/
+obj_aimac/
+*.o
+*.d

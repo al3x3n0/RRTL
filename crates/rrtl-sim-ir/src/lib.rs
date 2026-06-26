@@ -14,6 +14,33 @@ use rrtl_ir::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod bitparallel;
+pub mod bitslice;
+pub mod specialize;
+pub mod tabulate;
+pub use specialize::{
+    freeze_signals_program, rebalance_mux_chains_program, slot_allocate_program,
+    specialize_program, strength_reduce_program, FreezeStats, RebalanceStats, SlotStats,
+    SpecializeStats, StrengthStats,
+};
+
+pub mod instance_fold;
+pub use instance_fold::{analyze_instance_fold, FoldConnection, InstanceFold};
+
+pub mod value_range;
+pub use value_range::{block_maxbits, range_reduction_stats, RangeStats};
+
+pub mod activity;
+pub mod linearize;
+pub mod gpu_codegen;
+pub use activity::{register_support, RegisterSupport};
+
+#[cfg(feature = "jit")]
+pub mod jit;
+
+#[cfg(feature = "aot")]
+pub mod aot;
+
 /// Lane-packed simulation IR derived from a compiled RTL module.
 ///
 /// This is the higher-level public packed form: operations still carry expression
@@ -28,6 +55,14 @@ pub struct PackedProgram {
     pub top_signal_indices: HashMap<Signal, usize>,
     pub total_signal_words: usize,
     pub total_memory_words_per_lane: usize,
+    /// Maps a register's destination signal index to its clock's signal index,
+    /// for engines that gate register capture by clock edge (multi-clock). Empty
+    /// for designs whose registers carry no explicit clock; consulted only by the
+    /// `*_clocked` tick variants, so single-clock paths are unaffected.
+    pub reg_clocks: HashMap<usize, usize>,
+    /// Maps a memory index to its write clock's signal index (one clock per
+    /// memory), so the `*_clocked` ticks also gate memory writes by clock edge.
+    pub mem_clocks: HashMap<usize, usize>,
 }
 
 impl PackedProgram {
@@ -567,6 +602,7 @@ pub fn lower_to_packed_program(
         assignments: Vec::new(),
         registers: Vec::new(),
         memory_writes: Vec::new(),
+        mem_clocks: HashMap::new(),
         next_signal_offset: 0,
         next_memory_offset: 0,
     };
@@ -596,6 +632,12 @@ pub fn lower_to_packed_program(
         top_signal_indices: lower.top_signal_indices,
         total_signal_words: lower.next_signal_offset,
         total_memory_words_per_lane: lower.next_memory_offset,
+        reg_clocks: lower
+            .registers
+            .iter()
+            .filter_map(|reg| reg.clock.map(|clk| (reg.signal, clk)))
+            .collect(),
+        mem_clocks: lower.mem_clocks,
     })
 }
 
@@ -805,6 +847,59 @@ fn collect_op_reads(op: &PackedOp, signals: &mut [bool], memories: &mut [bool]) 
             collect_expr_reads(data, signals, memories);
         }
     }
+}
+
+/// Backward cone-of-influence from a set of OBSERVED signals/memories: every signal
+/// and memory that transitively feeds an observed one — through combinational defs
+/// and register next-state cones. Everything outside the cone is dead for those
+/// observations and can be pruned (feed the returned masks to [`slice_present`]).
+///
+/// This is the static "compute only what you observe" optimization: a testbench
+/// checks a handful of outputs (a checksum, a trap, a bus trace), so most of the
+/// design falls out of the cone. Because the observed set is fixed it is data-
+/// oblivious, so the pruned program composes with every backend and multiplies the
+/// batch/GPU throughput. Returns `(present_signals, present_memories)` masks.
+pub fn cone_of_influence(
+    program: &PackedProgram,
+    observed_signals: &[usize],
+    observed_memories: &[usize],
+) -> (Vec<bool>, Vec<bool>) {
+    let mut sig = vec![false; program.signals.len()];
+    let mut mem = vec![false; program.memories.len()];
+    for &s in observed_signals {
+        if s < sig.len() {
+            sig[s] = true;
+        }
+    }
+    for &m in observed_memories {
+        if m < mem.len() {
+            mem[m] = true;
+        }
+    }
+    // Fixpoint: an op's reads enter the cone once its destination is in the cone.
+    loop {
+        let before =
+            sig.iter().filter(|x| **x).count() + mem.iter().filter(|x| **x).count();
+        for stream in [
+            &program.streams.async_reset_comb,
+            &program.streams.comb,
+            &program.streams.tick_next,
+            &program.streams.tick_commit,
+        ] {
+            for packet in stream {
+                for op in &packet.ops {
+                    if op_present(op, &sig, &mem) {
+                        collect_op_reads(op, &mut sig, &mut mem);
+                    }
+                }
+            }
+        }
+        let after = sig.iter().filter(|x| **x).count() + mem.iter().filter(|x| **x).count();
+        if after == before {
+            break;
+        }
+    }
+    (sig, mem)
 }
 
 fn remap_signal(old: usize, signal_map: &[Option<usize>]) -> Result<usize, ErrorReport> {
@@ -1093,6 +1188,10 @@ pub fn slice_present(
         top_signal_indices,
         total_signal_words: signal_offset,
         total_memory_words_per_lane: memory_offset,
+        // Slicing (partitioned JIT) is single-clock-oriented; clock gating in a
+        // slice would need index remapping, omitted until the two are combined.
+        reg_clocks: HashMap::new(),
+        mem_clocks: HashMap::new(),
     };
 
     Ok(PackedSlice {
@@ -1352,6 +1451,15 @@ pub struct PartitionedSimulator {
     handle_group: HashMap<Signal, usize>,
     lanes: usize,
     parallel: bool,
+    /// Per group, the local signal indices that are combinational-cone *leaves*
+    /// (kind `Input` or `Reg`) — the group's activity inputs. A group can be
+    /// skipped on any cycle where none of these changed (see `tick_activity`).
+    activity_inputs: Vec<Vec<usize>>,
+    /// Per group, the activity-input values as of that group's last settle (empty
+    /// = never settled, forcing the first tick to evaluate every group).
+    activity_snap: Vec<Vec<u32>>,
+    activity_skips: u64,
+    activity_total: u64,
 }
 
 fn exchange_route(groups: &mut [GroupSim], route: &BoundaryRoute, lanes: usize) {
@@ -1507,6 +1615,25 @@ impl PartitionedSimulator {
             .saturating_mul(lanes);
         let parallel = groups.len() > 1 && ops_per_tick >= PARALLEL_WORK_THRESHOLD;
 
+        // Activity inputs per group: cone leaves = signals of kind Input or Reg.
+        let activity_inputs: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .sim
+                    .program()
+                    .signals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        matches!(s.kind, PackedSignalKind::Input | PackedSignalKind::Reg)
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        let activity_snap = vec![Vec::new(); groups.len()];
+
         Ok(Self {
             groups,
             routes,
@@ -1514,6 +1641,10 @@ impl PartitionedSimulator {
             handle_group,
             lanes,
             parallel,
+            activity_inputs,
+            activity_snap,
+            activity_skips: 0,
+            activity_total: 0,
         })
     }
 
@@ -1601,6 +1732,99 @@ impl PartitionedSimulator {
                 .expect("group tick");
         }
         self.eval_combinational();
+    }
+
+    /// Current activity-input values of group `g`, flattened over (signal, lane,
+    /// limb) for change detection.
+    fn group_activity_values(&self, g: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &idx in &self.activity_inputs[g] {
+            for lane in 0..self.lanes {
+                out.extend(self.groups[g].sim.inner().signal_limbs_at(idx, lane));
+            }
+        }
+        out
+    }
+
+    /// Like [`tick`](Self::tick) but **activity-skipped**: a group is evaluated
+    /// (and its registers captured/committed) only on cycles where one of its
+    /// combinational-cone leaf signals (inputs/registers) changed. A skipped
+    /// group's registers hold and its combinational outputs are already correct in
+    /// storage, so consumers reading them (via boundary exchange) stay correct.
+    /// Bit-identical to `tick` for register-cone partitions (all boundary routes
+    /// stable); falls back to evaluating everything if combinational cross-group
+    /// boundaries exist. Returns `(skipped_groups, total_groups)` for this tick.
+    pub fn tick_activity(&mut self) -> (u64, u64) {
+        let n = self.groups.len();
+        let has_comb_routes = self.routes.iter().any(|r| !r.stable);
+
+        // Phase 1 (next-state): exchange stable boundaries, then settle + capture
+        // + commit any group whose cone leaves changed *since that group's last
+        // capture settle*. The leaf snapshot is taken HERE (and only here): a
+        // group's next-state is a function of its leaves at the clock edge, so a
+        // self-updating register (e.g. a counter, whose leaf is its own register)
+        // sees its leaf change every cycle and is correctly never skipped.
+        for route in self.routes.iter().filter(|r| r.stable) {
+            exchange_route(&mut self.groups, route, self.lanes);
+        }
+        let mut active1 = vec![false; n];
+        for g in 0..n {
+            let cur = self.group_activity_values(g);
+            let changed =
+                has_comb_routes || self.activity_snap[g].is_empty() || self.activity_snap[g] != cur;
+            if changed {
+                active1[g] = true;
+                self.groups[g].sim.eval_combinational().expect("group eval");
+                self.activity_snap[g] = cur;
+            }
+        }
+        for g in 0..n {
+            if active1[g] {
+                self.groups[g]
+                    .sim
+                    .tick_from_evaluated_no_post_eval()
+                    .expect("group tick");
+            }
+        }
+
+        // Phase 2 (observability re-settle): refresh combinational outputs of any
+        // group that committed a register this cycle, or that consumes a committed
+        // group's output, so post-tick `get_signal` is bit-exact with the oracle.
+        // This does NOT touch the next-state snapshot.
+        for route in self.routes.iter().filter(|r| r.stable) {
+            exchange_route(&mut self.groups, route, self.lanes);
+        }
+        let mut resettle = active1.clone();
+        for route in &self.routes {
+            if active1[route.producer_group] {
+                resettle[route.consumer_group] = true;
+            }
+        }
+        for g in 0..n {
+            if resettle[g] {
+                self.groups[g].sim.eval_combinational().expect("group eval");
+            }
+        }
+
+        let skipped = (0..n).filter(|&g| !active1[g]).count() as u64;
+        self.activity_skips += skipped;
+        self.activity_total += n as u64;
+        (skipped, n as u64)
+    }
+
+    pub fn tick_many_activity(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.tick_activity();
+        }
+    }
+
+    /// Cumulative fraction of group-ticks skipped by `tick_activity`.
+    pub fn activity_skip_rate(&self) -> f64 {
+        if self.activity_total == 0 {
+            0.0
+        } else {
+            self.activity_skips as f64 / self.activity_total as f64
+        }
     }
 
     pub fn tick_many(&mut self, steps: usize) {
@@ -5065,6 +5289,9 @@ pub struct SimdCpuSimulator {
     inner: PackedSimulator,
     workspaces: SimdExecutionWorkspaces,
     last_simd_stats: SimdBlockStats,
+    /// During a `tick_clocked`, the set of memory indices to SKIP this step
+    /// (their write clock has no rising edge). `None` outside `tick_clocked`.
+    skip_mems: Option<std::collections::HashSet<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5219,6 +5446,7 @@ impl SimdCpuSimulator {
             inner,
             workspaces,
             last_simd_stats: SimdBlockStats::default(),
+            skip_mems: None,
         })
     }
 
@@ -5437,9 +5665,52 @@ impl SimdCpuSimulator {
         Ok(())
     }
 
+    /// Advance one step under an explicit set of clocks with a rising edge this
+    /// step (the multi-clock primitive; mirrors `rrtl_core::Simulator::tick_clocked`).
+    /// Registers whose clock is not in `active_clocks` hold. With every clock
+    /// listed this is identical to [`Self::tick`]. (Memory writes are not yet
+    /// clock-gated — register domains only.)
+    pub fn tick_clocked(&mut self, active_clocks: &[Signal]) -> Result<(), ErrorReport> {
+        let active: std::collections::HashSet<usize> = active_clocks
+            .iter()
+            .filter_map(|signal| self.inner.program.signal_index(*signal))
+            .collect();
+        // Memories whose write clock is inactive this step are skipped.
+        let skip: std::collections::HashSet<usize> = self
+            .inner
+            .program
+            .mem_clocks
+            .iter()
+            .filter(|(_, clk)| !active.contains(clk))
+            .map(|(&mem, _)| mem)
+            .collect();
+        self.eval_combinational()?;
+        self.capture_register_stream();
+        self.skip_mems = Some(skip);
+        self.execute_stream(PackedStreamKind::TickCommit);
+        self.skip_mems = None;
+        self.inner.commit_register_captures_clocked(&active);
+        self.eval_combinational()?;
+        Ok(())
+    }
+
     pub fn tick_many(&mut self, steps: usize) -> Result<(), ErrorReport> {
+        // Comb-fusion: `tick()` is comb→capture/commit→comb, so a naive loop runs
+        // the combinational stream TWICE per cycle. Across cycles the trailing comb
+        // (after commit) settles exactly the state the next cycle's leading comb
+        // would — so within `tick_many` (inputs fixed for the whole call) it is
+        // redundant. Evaluate comb once up front, then per cycle do capture/commit
+        // and a single comb (which serves as both the next cycle's leading settle
+        // and, on the last iteration, the final observable settle). This is
+        // bit-identical to the per-`tick()` loop, at ~half the comb work — the bulk
+        // of an RTL tick. (The GPU interpreter uses the same fusion.)
+        if steps == 0 {
+            return Ok(());
+        }
+        self.eval_combinational()?;
         for _ in 0..steps {
-            self.tick()?;
+            self.tick_from_evaluated_no_post_eval()?;
+            self.eval_combinational()?;
         }
         Ok(())
     }
@@ -5725,6 +5996,12 @@ impl SimdCpuSimulator {
                 addr,
                 data,
             } => {
+                // Multi-clock: skip writes whose memory's clock is inactive this step.
+                if let Some(skip) = &self.skip_mems {
+                    if skip.contains(memory) {
+                        return;
+                    }
+                }
                 state.stats.record_memory_write_effect();
                 let enable = state.value(*enable);
                 let addr = state.value(*addr);
@@ -8929,8 +9206,16 @@ impl PackedSimulator {
     }
 
     pub fn tick_many(&mut self, steps: usize) {
+        // Comb-fusion (see SimdCpuSimulator::tick_many): one comb up front, then
+        // per cycle capture/commit + a single comb that doubles as the next leading
+        // settle. Bit-identical to looping `tick()`, ~half the comb work.
+        if steps == 0 {
+            return;
+        }
+        self.eval_combinational();
         for _ in 0..steps {
-            self.tick();
+            self.tick_from_evaluated_no_post_eval();
+            self.eval_combinational();
         }
     }
 
@@ -9316,6 +9601,28 @@ impl PackedSimulator {
     fn commit_register_captures(&mut self) {
         for capture_index in 0..self.register_capture_count {
             let capture = &self.register_captures[capture_index];
+            debug_assert_eq!(capture.values.len(), capture.layout.limbs * self.lanes);
+            for limb in 0..capture.layout.limbs {
+                let start = (capture.layout.offset + limb) * self.lanes;
+                let source_start = limb * self.lanes;
+                self.values[start..start + self.lanes]
+                    .copy_from_slice(&capture.values[source_start..source_start + self.lanes]);
+            }
+        }
+    }
+
+    /// Like [`Self::commit_register_captures`] but commits only registers whose
+    /// clock is in `active` (a rising edge this step); a register with no entry
+    /// in `reg_clocks` (unclocked) always commits. Registers whose clock is
+    /// inactive keep their current value (the capture is computed but discarded).
+    fn commit_register_captures_clocked(&mut self, active: &std::collections::HashSet<usize>) {
+        for capture_index in 0..self.register_capture_count {
+            let capture = &self.register_captures[capture_index];
+            if let Some(clock) = self.program.reg_clocks.get(&capture.signal) {
+                if !active.contains(clock) {
+                    continue;
+                }
+            }
             debug_assert_eq!(capture.values.len(), capture.layout.limbs * self.lanes);
             for limb in 0..capture.layout.limbs {
                 let start = (capture.layout.offset + limb) * self.lanes;
@@ -11894,6 +12201,8 @@ struct Lowering<'a> {
     assignments: Vec<FlatAssignment>,
     registers: Vec<CompiledRegRef>,
     memory_writes: Vec<PackedOp>,
+    /// Memory index → its write clock's signal index (one clock per memory).
+    mem_clocks: HashMap<usize, usize>,
     next_signal_offset: usize,
     next_memory_offset: usize,
 }
@@ -11903,6 +12212,8 @@ struct CompiledRegRef {
     signal: usize,
     next: PackedExpr,
     reset: Option<PackedReset>,
+    /// Packed signal index of this register's clock, if one is associated.
+    clock: Option<usize>,
 }
 
 impl<'a> Lowering<'a> {
@@ -12069,14 +12380,22 @@ impl<'a> Lowering<'a> {
                     .reset
                     .as_ref()
                     .and_then(|reset| self.lower_reset(instance, &module, reg, reset));
+                let clock = self.signal_index(instance, reg.clock, &module);
                 self.registers.push(CompiledRegRef {
                     signal,
                     next,
                     reset,
+                    clock,
                 });
             }
             for write in &module.memory_writes {
                 if let Some(op) = self.lower_memory_write(instance, &module, write) {
+                    if let PackedOp::MemoryWrite { memory, .. } = &op {
+                        if let Some(clk) = self.signal_index(instance, write.clock, &module) {
+                            // One clock per memory (the common case); first wins.
+                            self.mem_clocks.entry(*memory).or_insert(clk);
+                        }
+                    }
                     self.memory_writes.push(op);
                 }
             }
@@ -12794,6 +13113,90 @@ mod tests {
     use super::*;
     use rrtl_core::{compile, concat, lit_s, lit_u, mux, sext, sint, uint, Design, Simulator};
 
+    // The batch SIMD engine's clock-gated tick must match the gold oracle on an
+    // independent multi-clock design (two counters on distinct clocks driven at
+    // different rates) — the engine-side of multi-clock support.
+    #[test]
+    fn simd_cpu_tick_clocked_matches_oracle() {
+        let mut design = Design::new();
+        let (clka, clkb, a, b);
+        {
+            let mut m = design.module("TwoClock");
+            clka = m.input("clka", uint(1));
+            clkb = m.input("clkb", uint(1));
+            let ca = m.reg("countA", uint(8));
+            let cb = m.reg("countB", uint(8));
+            m.clock(ca, clka);
+            m.clock(cb, clkb);
+            m.next(ca, ca + lit_u(1, 8));
+            m.next(cb, cb + lit_u(1, 8));
+            a = m.output("a", uint(8));
+            b = m.output("b", uint(8));
+            m.assign(a, ca);
+            m.assign(b, cb);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "TwoClock").unwrap();
+        // The clock association survived lowering into the side-table.
+        assert_eq!(program.reg_clocks.len(), 2);
+
+        let mut sim = SimdCpuSimulator::new(program, 1).unwrap();
+        let mut gold = Simulator::new(&design, "TwoClock").unwrap();
+        for step in 0..12 {
+            // clkA every step; clkB every 3rd step — an irregular multi-rate schedule.
+            let active: Vec<_> = if step % 3 == 0 { vec![clka, clkb] } else { vec![clka] };
+            sim.tick_clocked(&active).unwrap();
+            gold.tick_clocked(&active).unwrap();
+            assert_eq!(sim.get_signal(a).unwrap()[0], gold.get(a), "a@{step}");
+            assert_eq!(sim.get_signal(b).unwrap()[0], gold.get(b), "b@{step}");
+        }
+        // The slow domain really lagged the fast one.
+        assert!(sim.get_signal(b).unwrap()[0] < sim.get_signal(a).unwrap()[0]);
+    }
+
+    // A memory written on a slow clock must capture only on that clock's edges —
+    // the engine's clock-gated memory write vs the gold oracle.
+    #[test]
+    fn simd_cpu_tick_clocked_gates_memory_writes() {
+        let mut design = Design::new();
+        let (clka, clkb, out);
+        {
+            let mut m = design.module("MemClk");
+            clka = m.input("clka", uint(1));
+            clkb = m.input("clkb", uint(1));
+            let cnt = m.reg("cnt", uint(8));
+            m.clock(cnt, clka);
+            m.next(cnt, cnt + lit_u(1, 8));
+            // mem[0] <= cnt, clocked by the SLOW clock clkb (enable always on).
+            let mem = m.mem("mem", 2, uint(8), 4);
+            m.mem_write(mem, clkb, lit_u(1, 1), lit_u(0, 2), cnt);
+            let rd = m.mem_read(mem, lit_u(0, 2));
+            out = m.output("out", uint(8));
+            m.assign(out, rd);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "MemClk").unwrap();
+        assert_eq!(program.mem_clocks.len(), 1, "memory's write clock survived lowering");
+
+        let mut sim = SimdCpuSimulator::new(program, 1).unwrap();
+        let mut gold = Simulator::new(&design, "MemClk").unwrap();
+        let mut updates = 0u128;
+        let mut prev = 0u128;
+        for step in 0..12 {
+            let active: Vec<_> = if step % 3 == 0 { vec![clka, clkb] } else { vec![clka] };
+            sim.tick_clocked(&active).unwrap();
+            gold.tick_clocked(&active).unwrap();
+            let o = sim.get_signal(out).unwrap()[0];
+            assert_eq!(o, gold.get(out), "out@{step}");
+            if o != prev {
+                updates += 1;
+                prev = o;
+            }
+        }
+        // The memory output changed only on clkB edges, not every (clkA) step.
+        assert!(updates <= 5, "memory write was not clock-gated (updates={updates})");
+    }
+
     // Exercises the one-limb binop kernels against an independent scalar
     // reference. On x86_64 this drives the AVX2 vector body plus its scalar
     // tail (lengths chosen to be non-multiples of 8 and 4); on aarch64 it
@@ -12880,6 +13283,37 @@ mod tests {
             3
         );
         assert_eq!(program.streams.comb.len(), 2);
+    }
+
+    #[test]
+    fn cone_of_influence_prunes_unobserved_logic() {
+        // Two independent accumulators; observing one must exclude the other.
+        let mut design = Design::new();
+        let (clk, a, b, ra, rb);
+        {
+            let mut m = design.module("Two");
+            clk = m.input("clk", uint(1));
+            a = m.input("a", uint(32));
+            b = m.input("b", uint(32));
+            ra = m.reg("ra", uint(32));
+            rb = m.reg("rb", uint(32));
+            m.clock(ra, clk);
+            m.clock(rb, clk);
+            m.next(ra, ra.value() + a.value());
+            m.next(rb, rb.value() + b.value());
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Two").unwrap();
+        let si = |s| program.signal_index(s).unwrap();
+        let (ra_i, rb_i, a_i, b_i) = (si(ra), si(rb), si(a), si(b));
+
+        let (sig, _) = cone_of_influence(&program, &[ra_i], &[]);
+        assert!(sig[ra_i] && sig[a_i], "observed register and its input are in the cone");
+        assert!(!sig[rb_i] && !sig[b_i], "the independent register and its input are pruned");
+
+        // and the slice keeps strictly fewer signals than the full program.
+        let slice = slice_present(&program, &sig, &vec![false; program.memories.len()]).unwrap();
+        assert!(slice.program.signals.len() < program.signals.len());
     }
 
     #[test]
@@ -14078,6 +14512,55 @@ mod tests {
         packed.tick_many(4);
         assert_eq!(simd.get_signal(q).unwrap(), packed.get_signal(q).unwrap());
         assert_eq!(simd.get_signal(y).unwrap(), packed.get_signal(y).unwrap());
+    }
+
+    /// The comb-fused `tick_many` must be bit-identical to the per-`tick()` loop
+    /// (`tick()` is unchanged — still comb→capture/commit→comb — so it is the naive
+    /// reference). Uses registers that evolve and a comb output reading them, over
+    /// many cycles, across multiple lanes.
+    #[test]
+    fn comb_fusion_tick_many_matches_naive_tick_loop() {
+        let (din, q, r, y, oc);
+        let mut design = Design::new();
+        {
+            let mut m = design.module("Fuse");
+            let clk = m.input("clk", uint(1));
+            din = m.input("din", uint(16));
+            q = m.reg("q", uint(16));
+            r = m.reg("r", uint(16));
+            m.clock(q, clk);
+            m.clock(r, clk);
+            // registers evolve and r depends combinationally on q
+            m.next(q, (q + din).trunc(16));
+            m.next(r, (r + (q.value() ^ din.value())).trunc(16));
+            y = m.output("y", uint(16));
+            oc = m.output("oc", uint(16));
+            m.assign(y, (q + r).trunc(16));
+            m.assign(oc, (q.value() ^ (r * din)).trunc(16));
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Fuse").unwrap();
+
+        let lanes = 5;
+        let dvals: Vec<u128> = vec![1, 7, 255, 4096, 65535];
+        for n in [0usize, 1, 2, 3, 17, 64, 257] {
+            // fresh engines so each `n` is an independent run from reset
+            let mut a = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+            let mut b = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+            a.set_signal(din, &dvals).unwrap();
+            b.set_signal(din, &dvals).unwrap();
+            for _ in 0..n {
+                a.tick().unwrap(); // naive double-comb reference
+            }
+            b.tick_many(n).unwrap(); // fused
+            for sig in [q, r, y, oc] {
+                assert_eq!(
+                    a.get_signal(sig).unwrap(),
+                    b.get_signal(sig).unwrap(),
+                    "comb-fusion diverged at n={n}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -16389,6 +16872,76 @@ mod tests {
             assert_eq!(u0.program.signals[boundary].kind, PackedSignalKind::Input);
             assert!(u0.signal_origin[boundary] < program.signals.len());
         }
+    }
+
+    #[test]
+    fn activity_skip_matches_oracle_and_skips_idle() {
+        // A free-running counter (always active) plus an 8-deep gated shift chain
+        // (idle whenever the enable is low and data is held). Activity-skipped
+        // ticks must be bit-identical to the whole-design oracle, and must skip a
+        // large fraction of group-ticks while the chain is idle.
+        let mut design = Design::new();
+        let (clk, en, din, octr, o);
+        {
+            let mut m = design.module("Chain");
+            clk = m.input("clk", uint(1));
+            en = m.input("en", uint(1));
+            din = m.input("din", uint(8));
+            let ctr = m.reg("ctr", uint(8));
+            m.clock(ctr, clk);
+            m.next(ctr, ctr.value() + lit_u(1, 8));
+            octr = m.output("octr", uint(8));
+            m.assign(octr, ctr);
+            let mut prev = din;
+            for i in 0..8 {
+                let s = m.reg(format!("s{i}"), uint(8));
+                m.clock(s, clk);
+                m.next(s, mux(en, prev.value(), s.value()));
+                prev = s;
+            }
+            o = m.output("o", uint(8));
+            m.assign(o, prev);
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Chain").unwrap();
+
+        let lanes = 4;
+        let mut oracle = PackedSimulator::new(program.clone(), lanes).unwrap();
+        let mut act = PartitionedSimulator::new_register_balanced(&program, 4, lanes).unwrap();
+        assert!(act.group_count() >= 2);
+
+        let clk_v = vec![1u128; lanes];
+        oracle.set_signal(clk, &clk_v).unwrap();
+        act.set_signal(clk, &clk_v).unwrap();
+
+        let mut held = vec![0u128; lanes];
+        for cycle in 0..60u32 {
+            // enable pulses 1-of-8; data only changes while enabled (else held).
+            let enable = (cycle % 8 == 0) as u128;
+            let en_v = vec![enable; lanes];
+            if enable != 0 {
+                held = (0..lanes as u128).map(|l| (l * 17 + cycle as u128) & 0xff).collect();
+            }
+            for s in [&mut oracle] {
+                s.set_signal(en, &en_v).unwrap();
+                s.set_signal(din, &held).unwrap();
+            }
+            act.set_signal(en, &en_v).unwrap();
+            act.set_signal(din, &held).unwrap();
+
+            oracle.tick();
+            act.tick_activity();
+
+            assert_eq!(oracle.get_signal(octr).unwrap(), act.get_signal(octr).unwrap(), "octr cycle {cycle}");
+            assert_eq!(oracle.get_signal(o).unwrap(), act.get_signal(o).unwrap(), "o cycle {cycle}");
+        }
+        // The counter group is always active; the 8 chain groups idle ~7/8 of the
+        // time, so overall skip rate should be substantial.
+        assert!(
+            act.activity_skip_rate() > 0.3,
+            "expected substantial skipping, got {:.3}",
+            act.activity_skip_rate()
+        );
     }
 
     #[test]
