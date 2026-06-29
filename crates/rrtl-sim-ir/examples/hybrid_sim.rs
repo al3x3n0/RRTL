@@ -158,20 +158,30 @@ fn main() {
                 println!("  [compiled] hybrid-JIT == full-JIT (crc,acc,count × {lanes} × 20 cyc): {}", if jmis == 0 { "YES" } else { "NO" });
                 assert_eq!(jmis, 0, "hybrid-JIT diverged from full-JIT");
 
-                let t = Instant::now();
+                // Thermally-robust timing: warm up, then INTERLEAVE the three
+                // measurements each trial (so they share thermal state) and take
+                // best-of-N (the least-throttled sample). REAL concurrency: linear
+                // on a worker thread (LinearAot is Send), non-linear JIT on main
+                // (it never crosses threads); disjoint state, no synchronization.
                 jf.tick_many(steps);
-                let jf_s = t.elapsed().as_secs_f64();
-                let t = Instant::now();
                 lj.tick_many(steps);
-                let lj_s = t.elapsed().as_secs_f64();
-                let t = Instant::now();
-                jn.tick_many(steps);
-                let jn_s = t.elapsed().as_secs_f64();
-                let hyb = lj_s + jn_s; // sequential (one core)
-                let conc = lj_s.max(jn_s); // concurrent: independent partitions on separate cores
-                println!("  full general (vector JIT)   : {:.1} M-lane-cyc/s", mlc(jf_s));
-                println!("  hybrid seq  (1 core)        : {:.1} M-lane-cyc/s  ({:.2}x)  [linear {:.1} + nonlinear {:.1} M/s]", mlc(hyb), jf_s / hyb, mlc(lj_s), mlc(jn_s));
-                println!("  hybrid conc (2 cores, est.) : {:.1} M-lane-cyc/s  ({:.2}x)  [disjoint state -> wall-clock = max]", mlc(conc), jf_s / conc);
+                jn.tick_many(steps); // warmup
+                let (mut bf, mut bseq, mut bconc) = (f64::MAX, f64::MAX, f64::MAX);
+                // ROTATE the order each trial so no measurement is systematically
+                // last (= warmest); best-of-N over rotated positions.
+                macro_rules! t_full { () => {{ let t = Instant::now(); jf.tick_many(steps); bf = bf.min(t.elapsed().as_secs_f64()); }}; }
+                macro_rules! t_seq { () => {{ let t = Instant::now(); lj.tick_many(steps); jn.tick_many(steps); bseq = bseq.min(t.elapsed().as_secs_f64()); }}; }
+                macro_rules! t_conc { () => {{ let t = Instant::now(); std::thread::scope(|sc| { sc.spawn(|| lj.tick_many(steps)); jn.tick_many(steps); }); bconc = bconc.min(t.elapsed().as_secs_f64()); }}; }
+                for trial in 0..9 {
+                    match trial % 3 {
+                        0 => { t_full!(); t_seq!(); t_conc!(); }
+                        1 => { t_conc!(); t_full!(); t_seq!(); }
+                        _ => { t_seq!(); t_conc!(); t_full!(); }
+                    }
+                }
+                println!("  full general (vector JIT)   : {:.1} M-lane-cyc/s", mlc(bf));
+                println!("  hybrid seq  (1 thread)      : {:.1} M-lane-cyc/s  ({:.2}x vs full)", mlc(bseq), bf / bseq);
+                println!("  hybrid conc (2 threads)     : {:.1} M-lane-cyc/s  ({:.2}x vs full, {:.2}x vs seq)  [best-of-9, rotated order]", mlc(bconc), bf / bconc, bseq / bconc);
             }
             _ => println!("  [compiled] vector JIT cannot compile this design (skipped)"),
         }
