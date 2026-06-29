@@ -109,6 +109,40 @@ impl GeneralEngine {
             }
         }
     }
+
+    fn is_jit(&self) -> bool {
+        #[cfg(feature = "jit")]
+        {
+            matches!(self, GeneralEngine::Jit { .. })
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            false
+        }
+    }
+
+    /// Read/write a signal by its LOCAL (sliced-program) index — used for
+    /// boundary exchange of signals that have no top-level handle (internal
+    /// registers exposed as boundary inputs). Only the JIT backend supports it
+    /// (it is index-addressed); the CPU is handle-addressed, so coupled hybrids
+    /// require the JIT general backend.
+    fn get_local(&self, _local: usize, _lane: usize) -> Result<u128, ErrorReport> {
+        match self {
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, .. } => Ok(jit.get_signal(_lane, _local) as u128),
+            _ => Err(hyb_err("get_local requires the JIT backend")),
+        }
+    }
+    fn set_local(&mut self, _local: usize, _lane: usize, _value: u128) -> Result<(), ErrorReport> {
+        match self {
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, .. } => {
+                jit.set_signal(_lane, _local, _value as u32);
+                Ok(())
+            }
+            _ => Err(hyb_err("set_local requires the JIT backend")),
+        }
+    }
 }
 
 /// Unwrap an output's defining expression to the single register it aliases
@@ -126,10 +160,15 @@ pub struct HybridSimulator {
     lin: LinearAot,
     nl: GeneralEngine,
     general_backend: &'static str,
-    lin_inputs: HashSet<usize>,         // program.signals indices the linear AOT drives
+    lin_caller_inputs: HashSet<usize>,  // PRIMARY inputs the caller drives into the AOT
     lin_regs: HashSet<usize>,           // linear register dsts (read from the AOT)
     output_alias: HashMap<usize, usize>, // output signal idx -> linear register idx it aliases
     nl_handles: HashSet<Signal>,        // handles the general engine serves
+    // Boundary exchange (coupled partitions). Indices: lin uses GLOBAL signal
+    // indices; the general engine uses LOCAL sliced-program indices.
+    gen_from_lin: Vec<(usize, usize)>,  // (general local boundary input, linear reg global)
+    lin_from_general: Vec<(usize, usize)>, // (linear-leaf global, general local owning it)
+    coupled: bool,
     lanes: usize,
 }
 
@@ -137,7 +176,6 @@ impl HybridSimulator {
     pub fn new(program: &PackedProgram, lanes: usize) -> Result<Self, ErrorReport> {
         let lin = LinearAot::compile(program, lanes)?;
         let lin_regs: HashSet<usize> = lin.linear_signals().iter().copied().collect();
-        let lin_inputs: HashSet<usize> = lin.input_leaves().iter().copied().collect();
 
         // Output ports that are simple aliases of a linear register are served by
         // the AOT; all other outputs (and the non-linear registers) are observed
@@ -169,21 +207,86 @@ impl HybridSimulator {
             }
         }
         let (present_sig, present_mem) = cone_of_influence(program, &observe, &[]);
-        let nl_program = slice_present(program, &present_sig, &present_mem)?.program;
-        let nl_handles: HashSet<Signal> = nl_program.signals.iter().filter_map(|s| s.source).collect();
-        let (nl, general_backend) = GeneralEngine::build(nl_program, lanes)?;
+        let slice = slice_present(program, &present_sig, &present_mem)?;
+        let nl_handles: HashSet<Signal> = slice.program.signals.iter().filter_map(|s| s.source).collect();
+
+        // Boundary exchange routes (coupling). A non-linear register is one the
+        // general engine owns; a linear leaf that is such a register must be fed
+        // to the AOT each cycle, and a general boundary input that is a linear
+        // register must be fed from the AOT.
+        let nonlinear_reg: HashSet<usize> = program
+            .signals
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| s.kind == PackedSignalKind::Reg && !lin_regs.contains(i))
+            .map(|(i, _)| i)
+            .collect();
+        let global_to_local: HashMap<usize, usize> =
+            slice.signal_origin.iter().enumerate().map(|(local, &g)| (g, local)).collect();
+        // general boundary inputs that are linear registers → fed from the AOT.
+        let gen_from_lin: Vec<(usize, usize)> = slice
+            .boundary_inputs
+            .iter()
+            .filter_map(|&b| {
+                let g = slice.signal_origin[b];
+                lin_regs.contains(&g).then_some((b, g))
+            })
+            .collect();
+        // linear leaves that are non-linear registers → fed from the general engine.
+        let lin_from_general: Vec<(usize, usize)> = lin
+            .input_leaves()
+            .iter()
+            .filter_map(|&g| {
+                (nonlinear_reg.contains(&g)).then(|| global_to_local.get(&g).map(|&local| (g, local)))?
+            })
+            .collect();
+        let coupled = !gen_from_lin.is_empty() || !lin_from_general.is_empty();
+
+        // Primary inputs the caller drives into the AOT = linear leaves that are
+        // NOT boundary registers (those come from exchange).
+        let lin_caller_inputs: HashSet<usize> =
+            lin.input_leaves().iter().copied().filter(|g| !nonlinear_reg.contains(g)).collect();
+
+        let (nl, general_backend) = GeneralEngine::build(slice.program, lanes)?;
+        if coupled && !nl.is_jit() {
+            return Err(hyb_err(
+                "coupled partitions need the vector-JIT general backend (boundary inputs are index-addressed); design did not fit the JIT",
+            ));
+        }
 
         Ok(Self {
             program: program.clone(),
             lin,
             nl,
             general_backend,
-            lin_inputs,
+            lin_caller_inputs,
             lin_regs,
             output_alias,
             nl_handles,
+            gen_from_lin,
+            lin_from_general,
+            coupled,
             lanes,
         })
+    }
+
+    /// Exchange register-stable boundary values between the partitions. Uses the
+    /// values committed by the previous cycle (the "old" register values a
+    /// synchronous tick reads), so it must run before both partitions tick.
+    fn exchange(&mut self) -> Result<(), ErrorReport> {
+        for &(local, g) in &self.gen_from_lin {
+            for lane in 0..self.lanes {
+                let v = self.lin.get_signal(g, lane);
+                self.nl.set_local(local, lane, v)?;
+            }
+        }
+        for &(g, local) in &self.lin_from_general {
+            for lane in 0..self.lanes {
+                let v = self.nl.get_local(local, lane)?;
+                self.lin.set_signal(g, lane, v);
+            }
+        }
+        Ok(())
     }
 
     pub fn lanes(&self) -> usize {
@@ -204,7 +307,7 @@ impl HybridSimulator {
             return Err(hyb_err("lane_values length != lanes"));
         }
         if let Some(fi) = self.program.signal_index(signal) {
-            if self.lin_inputs.contains(&fi) {
+            if self.lin_caller_inputs.contains(&fi) {
                 for (l, v) in lane_values.iter().enumerate() {
                     self.lin.set_signal(fi, l, *v);
                 }
@@ -234,14 +337,25 @@ impl HybridSimulator {
     }
 
     pub fn tick(&mut self) -> Result<(), ErrorReport> {
+        if self.coupled {
+            self.exchange()?;
+        }
         self.lin.tick();
         self.nl.tick()
     }
 
-    /// Advance `n` cycles, running the two partitions CONCURRENTLY: the linear
-    /// matrix AOT on a worker thread (it is `Send`) and the general engine on the
-    /// current thread. Disjoint state — no synchronization.
+    /// Advance `n` cycles. For INDEPENDENT partitions the two engines run
+    /// CONCURRENTLY (linear matrix AOT on a worker thread — it is `Send` — and the
+    /// general engine on the current thread; disjoint state, no synchronization).
+    /// For COUPLED partitions each cycle exchanges boundary registers, so the
+    /// engines run sequentially per cycle behind that barrier.
     pub fn tick_many(&mut self, n: usize) -> Result<(), ErrorReport> {
+        if self.coupled {
+            for _ in 0..n {
+                self.tick()?;
+            }
+            return Ok(());
+        }
         let lin = &mut self.lin;
         let nl = &mut self.nl;
         let mut nl_res = Ok(());
@@ -250,6 +364,11 @@ impl HybridSimulator {
             nl_res = nl.tick_many(n);
         });
         nl_res
+    }
+
+    /// Whether the partitions are coupled (require per-cycle boundary exchange).
+    pub fn is_coupled(&self) -> bool {
+        self.coupled
     }
 }
 
@@ -271,6 +390,44 @@ mod tests {
         let lanes = 64;
 
         let mut hyb = HybridSimulator::new(&program, lanes).unwrap();
+        let mut full = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        let clk = vec![1u128; lanes];
+        full.set_signal(h("clk"), &clk).unwrap();
+        hyb.set_signal(h("clk"), &clk).unwrap();
+
+        for cyc in 0..40u64 {
+            for (name, m) in [("rst", 1u128), ("din", 0xff), ("a", 0xffff), ("b", 0xffff)] {
+                let vals: Vec<u128> = (0..lanes)
+                    .map(|l| if name == "rst" { (cyc < 1) as u128 } else { (cyc.wrapping_mul(2654435761).wrapping_add(l as u64) as u128) & m })
+                    .collect();
+                full.set_signal(h(name), &vals).unwrap();
+                hyb.set_signal(h(name), &vals).unwrap();
+            }
+            full.tick().unwrap();
+            hyb.tick().unwrap();
+            for out in ["crc", "acc", "count"] {
+                let fv = full.get_signal(h(out)).unwrap();
+                let hv = hyb.get_signal(h(out)).unwrap();
+                assert_eq!(hv, fv, "{out} @ cyc{cyc}");
+            }
+        }
+    }
+
+    // mixed_coupled.sv: crc reads acc and acc reads crc across the cut, so the
+    // hybrid must EXCHANGE boundary registers every cycle. Coupling needs the
+    // JIT general backend (boundary inputs are index-addressed).
+    #[cfg(feature = "jit")]
+    #[test]
+    fn hybrid_matches_full_simd_cpu_coupled() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/sv/mixed_coupled.sv")).unwrap();
+        let imported = import_sv(&src, Some("mixed_coupled")).unwrap();
+        let compiled = rrtl_core::compile(&imported.design).unwrap();
+        let program = lower_to_packed_program(&compiled, "mixed_coupled").unwrap();
+        let h = |n: &str| compiled.find_module("mixed_coupled").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+        let lanes = 64;
+
+        let mut hyb = HybridSimulator::new(&program, lanes).unwrap();
+        assert!(hyb.is_coupled(), "design should be detected as coupled");
         let mut full = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
         let clk = vec![1u128; lanes];
         full.set_signal(h("clk"), &clk).unwrap();
