@@ -29,6 +29,88 @@ fn hyb_err(msg: impl Into<String>) -> ErrorReport {
     ErrorReport::new(vec![Diagnostic::new("E_HYBRID", msg)])
 }
 
+/// A general-purpose engine for the non-linear partition, behind a handle-keyed
+/// interface. The best available backend is auto-picked at construction: the
+/// vector JIT when the slice fits it (≤32-bit, no async reset), else the SIMD CPU
+/// interpreter (which handles any width/op). Both consume the same sliced program.
+enum GeneralEngine {
+    Cpu(SimdCpuSimulator),
+    #[cfg(feature = "jit")]
+    Jit {
+        jit: crate::jit::SimdJitSimulator,
+        idx: HashMap<Signal, usize>, // handle -> machine signal index
+        lanes: usize,
+    },
+}
+
+impl GeneralEngine {
+    /// Pick the fastest backend that can run `program` (vector JIT preferred).
+    fn build(program: PackedProgram, lanes: usize) -> Result<(Self, &'static str), ErrorReport> {
+        #[cfg(feature = "jit")]
+        {
+            let machine = crate::lower_to_machine_program(&program);
+            if let Ok(jit) = crate::jit::SimdJitSimulator::compile_lanes(&machine, lanes) {
+                let idx: HashMap<Signal, usize> = program
+                    .signals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.source.map(|h| (h, i)))
+                    .collect();
+                return Ok((GeneralEngine::Jit { jit, idx, lanes }, "vector-JIT"));
+            }
+        }
+        Ok((GeneralEngine::Cpu(SimdCpuSimulator::new(program, lanes)?), "SIMD-CPU"))
+    }
+
+    fn set_signal(&mut self, signal: Signal, vals: &[u128]) -> Result<(), ErrorReport> {
+        match self {
+            GeneralEngine::Cpu(c) => c.set_signal(signal, vals),
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, idx, .. } => {
+                if let Some(&i) = idx.get(&signal) {
+                    for (l, v) in vals.iter().enumerate() {
+                        jit.set_signal(l, i, *v as u32);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn get_signal(&self, signal: Signal) -> Result<Vec<u128>, ErrorReport> {
+        match self {
+            GeneralEngine::Cpu(c) => c.get_signal(signal),
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, idx, lanes } => {
+                let i = *idx.get(&signal).ok_or_else(|| hyb_err("signal not in JIT slice"))?;
+                Ok((0..*lanes).map(|l| jit.get_signal(l, i) as u128).collect())
+            }
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), ErrorReport> {
+        match self {
+            GeneralEngine::Cpu(c) => c.tick(),
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, .. } => {
+                jit.tick();
+                Ok(())
+            }
+        }
+    }
+
+    fn tick_many(&mut self, n: usize) -> Result<(), ErrorReport> {
+        match self {
+            GeneralEngine::Cpu(c) => c.tick_many(n),
+            #[cfg(feature = "jit")]
+            GeneralEngine::Jit { jit, .. } => {
+                jit.tick_many(n);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Unwrap an output's defining expression to the single register it aliases
 /// (`Signal(reg)`, possibly through a width cast/extension), else `None`.
 fn alias_target(expr: &PackedExpr) -> Option<usize> {
@@ -42,7 +124,8 @@ fn alias_target(expr: &PackedExpr) -> Option<usize> {
 pub struct HybridSimulator {
     program: PackedProgram,
     lin: LinearAot,
-    nl: SimdCpuSimulator,
+    nl: GeneralEngine,
+    general_backend: &'static str,
     lin_inputs: HashSet<usize>,         // program.signals indices the linear AOT drives
     lin_regs: HashSet<usize>,           // linear register dsts (read from the AOT)
     output_alias: HashMap<usize, usize>, // output signal idx -> linear register idx it aliases
@@ -88,12 +171,13 @@ impl HybridSimulator {
         let (present_sig, present_mem) = cone_of_influence(program, &observe, &[]);
         let nl_program = slice_present(program, &present_sig, &present_mem)?.program;
         let nl_handles: HashSet<Signal> = nl_program.signals.iter().filter_map(|s| s.source).collect();
-        let nl = SimdCpuSimulator::new(nl_program, lanes)?;
+        let (nl, general_backend) = GeneralEngine::build(nl_program, lanes)?;
 
         Ok(Self {
             program: program.clone(),
             lin,
             nl,
+            general_backend,
             lin_inputs,
             lin_regs,
             output_alias,
@@ -104,6 +188,13 @@ impl HybridSimulator {
 
     pub fn lanes(&self) -> usize {
         self.lanes
+    }
+
+    /// Which general backend was auto-picked for the non-linear partition
+    /// (`"vector-JIT"` or `"SIMD-CPU"`). The linear partition always uses the
+    /// GF(2) matrix AOT.
+    pub fn general_backend(&self) -> &'static str {
+        self.general_backend
     }
 
     /// Drive an input across all lanes. Routed to whichever partition reads it

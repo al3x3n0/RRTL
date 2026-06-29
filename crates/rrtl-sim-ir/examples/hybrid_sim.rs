@@ -186,4 +186,43 @@ fn main() {
             _ => println!("  [compiled] vector JIT cannot compile this design (skipped)"),
         }
     }
+
+    // The auto-partitioning HybridSimulator: one unified engine that detects the
+    // linear cones, auto-picks the best general backend for the rest, and runs
+    // them concurrently. Validate it against the full SIMD CPU and time it.
+    {
+        use rrtl_sim_ir::hybrid::HybridSimulator;
+        let mut hyb = HybridSimulator::new(&program, lanes).unwrap();
+        let mut oracle = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        oracle.set_signal(h("clk"), &vec![1u128; lanes]).unwrap();
+        hyb.set_signal(h("clk"), &vec![1u128; lanes]).unwrap();
+        let mut mism = 0usize;
+        for cyc in 0..40u64 {
+            for (name, m) in [("rst", 1u128), ("din", 0xff), ("a", 0xffff), ("b", 0xffff)] {
+                let vals: Vec<u128> = (0..lanes)
+                    .map(|l| if name == "rst" { (cyc < 1) as u128 } else { inval(cyc + name.len() as u64, l, m) })
+                    .collect();
+                oracle.set_signal(h(name), &vals).unwrap();
+                hyb.set_signal(h(name), &vals).unwrap();
+            }
+            oracle.tick().unwrap();
+            hyb.tick().unwrap();
+            for out in ["crc", "acc", "count"] {
+                let (o, hv) = (oracle.get_signal(h(out)).unwrap(), hyb.get_signal(h(out)).unwrap());
+                for l in 0..lanes {
+                    mism += (o[l] != hv[l]) as usize;
+                }
+            }
+        }
+        let t = Instant::now();
+        hyb.tick_many(steps).unwrap();
+        let s = t.elapsed().as_secs_f64();
+        println!(
+            "  HybridSimulator: linear=matrix-AOT + general={} (auto), concurrent; bit-exact: {}; {:.1} M-lane-cyc/s",
+            hyb.general_backend(),
+            if mism == 0 { "YES" } else { "NO" },
+            mlc(s),
+        );
+        assert_eq!(mism, 0, "HybridSimulator diverged");
+    }
 }
