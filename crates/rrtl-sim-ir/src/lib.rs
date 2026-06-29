@@ -16,8 +16,17 @@ use serde::{Deserialize, Serialize};
 
 pub mod bitparallel;
 pub mod bitslice;
+pub mod policy;
 pub mod specialize;
 pub mod tabulate;
+pub use policy::{
+    apply_machine_optimization_policy, apply_packed_optimization_policy, MachineOptimizationResult,
+    MemoryInitializer, OptimizationBackend, OptimizationGoal, OptimizationPass, OptimizationPolicy,
+    OptimizationPolicyRecommendation, OptimizationReport, OptimizationRequest, OptimizationStep,
+    PackedOptimizationResult, PolicyOptimizationResult, RecommendedOptimizationResult,
+    optimize_for_goal, optimize_with_policy, optimize_with_request, recommend_optimization_policy,
+    recommend_optimization_policy_for_request,
+};
 pub use specialize::{
     freeze_signals_program, rebalance_mux_chains_program, slot_allocate_program,
     specialize_program, strength_reduce_program, FreezeStats, RebalanceStats, SlotStats,
@@ -40,6 +49,9 @@ pub mod jit;
 
 #[cfg(feature = "aot")]
 pub mod aot;
+
+#[cfg(feature = "aot")]
+pub mod linear_aot;
 
 /// Lane-packed simulation IR derived from a compiled RTL module.
 ///
