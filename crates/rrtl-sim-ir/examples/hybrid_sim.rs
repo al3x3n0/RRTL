@@ -10,7 +10,9 @@
 //! SIMD CPU oracle; throughput is full-general vs (linear-AOT + sliced-general).
 //! Build: cargo run --release --features "aot jit" -p rrtl-sim-ir --example hybrid_sim -- [lanes steps]
 use rrtl_sim_ir::linear_aot::LinearAot;
-use rrtl_sim_ir::{cone_of_influence, lower_to_packed_program, slice_present, SimdCpuSimulator};
+use rrtl_sim_ir::{
+    cone_of_influence, lower_to_machine_program, lower_to_packed_program, slice_present, SimdCpuSimulator,
+};
 use rrtl_sv_frontend::import_sv;
 use std::time::Instant;
 
@@ -112,4 +114,66 @@ fn main() {
     let hybrid_s = lin_s + nl_s; // sequential; the two engines could also run concurrently
     println!("  full general (SIMD CPU)     : {:.1} M-lane-cyc/s", mlc(full_s));
     println!("  hybrid: linear-AOT + sliced : {:.1} M-lane-cyc/s  ({:.2}x)  [linear {:.1} + nonlinear {:.1} M/s]", mlc(hybrid_s), full_s / hybrid_s, mlc(lin_s), mlc(nl_s));
+
+    // Compiled baseline: the honest comparison is vs the vector JIT (not the
+    // interpreter). full vector-JIT vs (linear-AOT + sliced vector-JIT).
+    #[cfg(feature = "jit")]
+    {
+        use rrtl_sim_ir::jit::SimdJitSimulator;
+        let machine_full = lower_to_machine_program(&program);
+        let machine_nl = lower_to_machine_program(&nl_program);
+        match (
+            SimdJitSimulator::compile_lanes(&machine_full, lanes),
+            SimdJitSimulator::compile_lanes(&machine_nl, lanes),
+        ) {
+            (Ok(mut jf), Ok(mut jn)) => {
+                let mut lj = LinearAot::compile(&program, lanes).unwrap();
+                let fi = |n: &str| program.signal_index(h(n)).unwrap();
+                let ni = |n: &str| nl_program.signal_index(h(n)).unwrap();
+                // self-consistent bit-exact: hybrid-JIT == full-JIT (full-JIT == oracle
+                // is established by Phase A + the JIT being an independently-validated engine).
+                let mut jmis = 0usize;
+                for cyc in 0..20u64 {
+                    for (name, m) in [("rst", 1u128), ("din", 0xff), ("a", 0xffff), ("b", 0xffff)] {
+                        for l in 0..lanes {
+                            let v = if name == "rst" { (cyc < 1) as u128 } else { inval(cyc + name.len() as u64, l, m) };
+                            jf.set_signal(l, fi(name), v as u32);
+                            if name == "a" || name == "b" || name == "rst" {
+                                jn.set_signal(l, ni(name), v as u32);
+                            }
+                            if name == "din" || name == "rst" {
+                                lj.set_signal(pos(name), l, v);
+                            }
+                        }
+                    }
+                    jf.tick();
+                    jn.tick();
+                    lj.tick();
+                    for l in 0..lanes {
+                        jmis += (lj.get_signal(crc_dst, l) as u32 != jf.get_signal(l, fi("crc"))) as usize;
+                        jmis += (jn.get_signal(l, ni("acc")) != jf.get_signal(l, fi("acc"))) as usize;
+                        jmis += (jn.get_signal(l, ni("count")) != jf.get_signal(l, fi("count"))) as usize;
+                    }
+                }
+                println!("  [compiled] hybrid-JIT == full-JIT (crc,acc,count × {lanes} × 20 cyc): {}", if jmis == 0 { "YES" } else { "NO" });
+                assert_eq!(jmis, 0, "hybrid-JIT diverged from full-JIT");
+
+                let t = Instant::now();
+                jf.tick_many(steps);
+                let jf_s = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                lj.tick_many(steps);
+                let lj_s = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                jn.tick_many(steps);
+                let jn_s = t.elapsed().as_secs_f64();
+                let hyb = lj_s + jn_s; // sequential (one core)
+                let conc = lj_s.max(jn_s); // concurrent: independent partitions on separate cores
+                println!("  full general (vector JIT)   : {:.1} M-lane-cyc/s", mlc(jf_s));
+                println!("  hybrid seq  (1 core)        : {:.1} M-lane-cyc/s  ({:.2}x)  [linear {:.1} + nonlinear {:.1} M/s]", mlc(hyb), jf_s / hyb, mlc(lj_s), mlc(jn_s));
+                println!("  hybrid conc (2 cores, est.) : {:.1} M-lane-cyc/s  ({:.2}x)  [disjoint state -> wall-clock = max]", mlc(conc), jf_s / conc);
+            }
+            _ => println!("  [compiled] vector JIT cannot compile this design (skipped)"),
+        }
+    }
 }
