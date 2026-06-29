@@ -1693,6 +1693,60 @@ form the hardware accelerator can take directly, with the crossover characterize
   signals are top-prefixed and slot-indexed — address the kernel by packed slot index.
 - All GPU example runs use a background launch + kill-after-timeout guard (Metal/driver hangs).
 
+### 4i.5 The matrix form as a native CPU engine, and a multi-engine partitioned simulator
+
+§4i.3 showed the BMMA form *losing* to the gate tree on a popcount-only GPU. On the **CPU** the same
+matrix `M` has a different, winning realization. Transpose `M` (column-major) into per-output-bit rows and
+each output bit becomes a flat **XOR of input-bit planes** — no AND-popcount, no per-bit loop. Emitted as
+bit-sliced `uint64_t` C (one word = 64 lanes) with an inner word loop, clang `-O3` auto-vectorizes it; and
+because it is *pure XOR* — no ripple-carry, no width dispatch, no mux — it vectorizes better than the
+gate-level bit-slice AOT (§4g.4b), which must evaluate the full unrolled-CRC netlist. crc32 collapses to
+73 planes / 91 word-XORs per cycle. Measured (4096 lanes, bit-exact against the SIMD-CPU oracle;
+same-process back-to-back ratios, since this laptop throttles erratically — see the methodology note below):
+the **matrix XOR-AOT runs ~2.0–3.5× the gate-level bit-slice AOT and ~1.0–1.7× the vector JIT** on crc32.
+So the linear analysis pays *on the CPU too*: the compact matrix beats evaluating the gate netlist, and it is
+the portable XOR-GEMM that a real tensor core would only accelerate further.
+
+That makes the matrix a *backend* like any other, and the natural next step is a simulator that uses it for
+the linear cones and a general engine for the rest — **automatically**. `HybridSimulator::new(program, lanes)`
+(1) detects the GF(2)-linear register cones and compiles them to the matrix XOR-AOT, (2) derives a
+backward cone-of-influence over the non-linear registers and observability-slices the design (§4j) so the
+linear cones are *pruned* from the general engine, and (3) auto-picks the best general backend for the
+remainder — the vector JIT when the slice fits it (≤32-bit, no async reset), else the SIMD-CPU interpreter.
+It presents one handle-keyed `set`/`get`/`tick` interface and routes internally: a linear register, or an
+output port aliasing one, is read from the matrix AOT; everything else from the general engine; a shared
+input is driven into both. On the mixed design it auto-selects the vector JIT for the multiply-accumulate
+slice, pairs it with the matrix AOT for the CRC, and is **bit-exact** against the full SIMD CPU on every
+output. This is genuinely *multi-engine* simulation: heterogeneous backends, each chosen for its partition,
+composed behind one interface.
+
+The two partitions hold disjoint register state, so for **independent** partitions `tick_many` runs them
+**concurrently** — the matrix AOT (which is `Send`) on a worker thread, the general engine on the main
+thread (the JIT's code module is not `Send`, so keeping it on the main thread side-steps that cleanly). When
+the partitions are **coupled** — each reads the other's registers across the cut — correctness needs a
+per-cycle **boundary exchange**: the slicer's `signal_origin`/`boundary_inputs` maps already expose which
+signals cross, and we copy them (register-stable, using the previous cycle's committed values, before both
+partitions tick). Boundary signals that are internal registers carry no top-level handle, so they are
+addressed by *local index*; that is why the coupled path requires the index-addressed JIT general backend.
+`tick_many` runs coupled partitions sequentially per cycle behind the exchange barrier and keeps the
+concurrent batch for independent ones; both are bit-exact (validated on a mutually-coupled CRC/accumulator
+where `crc <= linearCRC(crc ⊕ acc)` and `acc <= acc + a·b + crc`).
+
+**The honest accounting.** The offload's value depends entirely on what it replaces. Against the SIMD-CPU
+*interpreter*, removing the unrolled CRC and running it as 91 XORs is ~3.6×. Against a *compiled* general
+engine the win is far smaller — the vector JIT already compiles the CRC efficiently — measured ~1.15× on a
+single thread for the 62%-linear mixed design, rising to ~1.47× when the independent partitions run on two
+threads. The dramatic gains are reserved for highly-linear designs (CRC/FEC/crypto-dominated) and for real
+1-bit tensor cores (the BMMA path, which this Apple-Silicon machine cannot run). The durable, machine-
+independent results are structural: bit-exactness, the linear work genuinely leaving the general engine, and
+the partitions being independent (concurrency-friendly) or coupled (correct under boundary exchange).
+
+*Measurement methodology (transferable).* On a thermally-throttling laptop, throughput ratios are treacherous:
+naïve timing reported a 2-thread "speedup" of 2.2× (above the 2× ceiling — physically impossible), because the
+concurrent run was always timed *last* each trial and caught the warmest clock state. Rotating the measurement
+order across trials and taking best-of-N stabilized it at a believable ~1.47×. A measured ratio above its
+theoretical bound is the tell-tale of ordering/thermal bias; rotate and take the best sample.
+
 ## 4j. Observability slicing: compute only what you observe
 
 The most RTL-sim-specific lever, and one of the largest, is almost embarrassingly simple: a testbench
@@ -1902,6 +1956,12 @@ Observability slicing (§4j) is `cone_of_influence` + `slice_present` (crate roo
 `examples/observe_slice.rs` (`--features jit`): 16 pipelines, observe one, reporting the prune fraction,
 instruction reduction, and JIT speedup, bit-exact on the observed register; unit-tested by
 `cone_of_influence_prunes_unobserved_logic`.
+
+The optimization policy layer is `crates/rrtl-sim-ir/src/policy.rs`, exercised by
+`examples/optimization_policy.rs`: it maps a goal plus optional observations to a conservative
+backend-aware pass stack, applies packed-level rewrites, lowers to machine IR, applies machine-level
+rewrites, and returns pass reports plus checked memory initializers for generated ROMs such as
+decode-tabulation tables. Unit coverage is under `policy::tests`.
 
 Sparse memory (§4k) is `examples/sparse_mem.rs` (`--features jit`, arg = `picorv32.v`): a demand-paged
 host memory runs picorv32 with code at 0 and stack near 1 GB, reporting pages allocated vs the dense span,
