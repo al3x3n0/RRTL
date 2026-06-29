@@ -53,6 +53,9 @@ pub mod aot;
 #[cfg(feature = "aot")]
 pub mod linear_aot;
 
+#[cfg(feature = "aot")]
+pub mod hybrid;
+
 /// Lane-packed simulation IR derived from a compiled RTL module.
 ///
 /// This is the higher-level public packed form: operations still carry expression
