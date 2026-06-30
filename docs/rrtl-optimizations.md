@@ -24,7 +24,10 @@ kernel** (OpenCL/CUDA, the GPU analogue of an AOT backend) that runs bit-exact o
 real Apple M3 GPU at **~93× a single fast CPU core** in batch, and we show that
 GF(2)-linear cones (CRC/FEC/crypto) reduce to a **1-bit matrix product** that maps
 directly onto tensor-core BMMA — offloadable selectively, per register cone, within
-a mixed design. For **gate-level netlists** — the regime where beating Verilator at
+a mixed design. The same linear structure also admits a **temporal leap**: the
+N-cycle evolution of a linear block is `M^N`, so its state can be jumped N cycles in
+**O(log N)** matrix mults (e.g. 2⁴⁰ cycles in 41), and a single varying-input stream
+folds into P independent segments — an *algorithmic* speedup, not a constant factor. For **gate-level netlists** — the regime where beating Verilator at
 scale matters most — a **bit-parallel** engine packs 64 lanes per machine word and
 evaluates each gate as one bitwise op; compiled by clang -O3 (auto-vectorized to
 128 lanes/op) and run multicore, it sustains **~186× a single Verilator instance** in
@@ -1746,6 +1749,39 @@ naïve timing reported a 2-thread "speedup" of 2.2× (above the 2× ceiling — 
 concurrent run was always timed *last* each trial and caught the warmest clock state. Rotating the measurement
 order across trials and taking best-of-N stabilized it at a believable ~1.47×. A measured ratio above its
 theoretical bound is the tell-tale of ordering/thermal bias; rotate and take the best sample.
+
+### 4i.6 Temporal leap: closed-form cycle jumps for linear blocks
+
+Every optimization so far reduces the *constant factor* per cycle. The linear extraction unlocks something
+stronger for GF(2)-linear blocks — a reduction in the *number of cycles simulated*. A linear register cone
+evolves `s(t+1) = M·s(t) ⊕ c` over GF(2), so `s(t+N) = M^N·s(t) ⊕ (Σ_{k<N} M^k)·c`, and **`M^N` by repeated
+squaring is O(log N) matrix mults** rather than N cycle-steps. This is the same structure that *defeated* the
+two ideas of §4f and the C-slow probe — register feedback / self-recurrence — turned into an asset: those
+techniques need the absence of feedback or its stability, whereas the leap *is* the recurrence, solved in closed
+form. `LinearLeap::build` assembles the combined transition matrix over a design's linear register cones
+(crc32's is two coupled registers, `crc` plus the blocking temp `c`, a 64-bit combined state) and the per-cycle
+constant; `leap_idle(s0, N)` exponentiates an augmented matrix. Validated bit-exact against step-by-step: N=100
+000 in 22 matmuls, **N=2⁴⁰ (≈10¹²) in 41 matmuls** — a state a stepping loop could never reach — all matching the
+stepped reference. Because the win is *op-count*, it is provable on a throttled machine where wall-clock is noise.
+
+Three generalizations make it a usable engine primitive. **(1) Constant input.** With the input held at `u`
+(not just idle), the per-cycle offset is `c_u = B·u ⊕ c` (the extracted input matrix `B`), and
+`s(N) = M^N·s0 ⊕ G_N·c_u` with `G_N = Σ_{k<N} M^k`. Obtaining `G_N` *as a matrix* — so each lane's distinct `c_u`
+can multiply it — uses the block matrix `[[M, I],[0, I]]^N = [[M^N, G_N],[0, I]]` (fits a 128-bit row when the
+state is ≤64 bits; crc32's 64 fits exactly). **(2) Streaming.** A *varying* input stream of length N splits into
+P segments, each processed from zero state independently (`V_i`) and stitched as
+`total = M^N·s0 ⊕ Σ_i M^{(P−1−i)L}·V_i` — the generalized zlib `crc32_combine`, for any linear block. Because the
+`V_i` are independent, one sequential linear stream becomes **P-way parallel** (`fold_stream` runs the segments
+on rayon), bit-exact. **(3) Integration.** `HybridSimulator::leap(N)` advances the *independent* linear partition
+by `M^N` (built once, applied per lane to the matrix-AOT's bit-sliced state) while the non-linear partition steps
+normally — bit-identical to `tick_many(N)` when the linear inputs are held constant; on `mixed.sv`,
+`leap(100 000) == tick_many(100 000)` exactly while the CRC partition jumps in ~17 matmuls.
+
+The regime is precise: the leap delivers the *final* state after N constant-input (or P-segmented varying-input)
+cycles — fast-forwarding a free-running LFSR/scrambler/counter to a checkpoint, aligning a descrambler, computing
+a CRC over a buffer, or skipping an idle linear submodule inside a hybrid — not per-cycle intermediates, and (for
+the constant-input form) a ≤64-bit linear state. Within that regime it is the rare optimization that changes the
+asymptotics: O(N) cycles → O(log N), or → N/P wall-clock for a single stream.
 
 ## 4j. Observability slicing: compute only what you observe
 
