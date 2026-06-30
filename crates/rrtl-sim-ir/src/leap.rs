@@ -261,6 +261,32 @@ impl LinearLeap {
         Some((mn, gn))
     }
 
+    /// Process a VARYING input stream (`stream[k]` = the packed input vector at
+    /// cycle k) through the linear block in P segments, IN PARALLEL: each segment
+    /// is stepped from zero state independently (rayon), then the per-segment
+    /// results are stitched with the `M^L` leap. Bit-identical to stepping the
+    /// whole stream sequentially, but the segments run P-way concurrent — the
+    /// single-stream parallelization (generalized `crc32_combine`). Falls back to
+    /// a sequential pass when `p ≤ 1` or `stream.len()` is not a multiple of `p`.
+    pub fn fold_stream(&self, s0: u128, stream: &[u128], p: usize) -> u128 {
+        let step_from = |start: u128, seg: &[u128]| -> u128 {
+            let mut s = start;
+            for &u in seg {
+                s = self.m.apply(s) ^ self.input_constant(u);
+            }
+            s
+        };
+        if p <= 1 || stream.is_empty() || stream.len() % p != 0 {
+            return step_from(s0, stream);
+        }
+        let l = stream.len() / p;
+        let vs: Vec<u128> = {
+            use rayon::prelude::*;
+            (0..p).into_par_iter().map(|i| step_from(0, &stream[i * l..(i + 1) * l])).collect()
+        };
+        self.fold(s0, l as u64, &vs)
+    }
+
     /// Combine `P` equal-length segment results (each the segment processed from
     /// ZERO state) into the full stream result, starting from `s0`:
     /// `total = M^{P·L}·s0 ⊕ Σ_i M^{(P-1-i)·L}·V_i`. The `seg_results` are
@@ -354,6 +380,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(leap.fold(pack(&s0), l as u64, &vs), seq, "fold P={p}");
+        }
+
+        // fold_stream: the parallel single-stream API (matrix-stepping internally)
+        // must also match the eval_expr-stepped sequential result. (din is the
+        // only input leaf, so the packed input vector at each cycle is din itself.)
+        for &p in &[1usize, 4, 8] {
+            assert_eq!(leap.fold_stream(pack(&s0), &stream, p), seq, "fold_stream P={p}");
         }
     }
 }
