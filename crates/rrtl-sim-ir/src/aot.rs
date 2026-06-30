@@ -83,14 +83,15 @@ fn build_layout(machine: &PackedMachineProgram) -> Layout {
         return Layout { off, mem_base, mem_entry, total: cur };
     }
     let align = |x: usize, a: usize| (x + a - 1) & !(a - 1);
-    // AOT_AFFINITY=1: order signals so a register cone's support (+ the register)
-    // is contiguous → co-accessed signals share cache lines. Structurally -40%
-    // cache-lines-touched/cone on picorv32 at +15% bytes (state_layout_probe);
-    // bit-exact by construction (offset permutation). Opt-in until the throughput
-    // win is confirmed on a non-throttled machine.
-    if std::env::var("AOT_AFFINITY").is_ok() {
+    // Signal slots come from the shared per-width packer (single source of truth,
+    // also the layout the JIT would adopt). AOT_AFFINITY=1 orders signals so a
+    // register cone's support (+ the register) is contiguous → co-accessed signals
+    // share cache lines (-40% lines/cone on picorv32 at +15% bytes; bit-exact, it
+    // is an offset permutation). Opt-in until the throughput win is confirmed on a
+    // non-throttled machine; default packs by size class.
+    let affinity_order: Option<Vec<usize>> = if std::env::var("AOT_AFFINITY").is_ok() {
         let supports = crate::register_support(&machine.source);
-        let mut order: Vec<usize> = Vec::with_capacity(widths.len());
+        let mut order = Vec::with_capacity(widths.len());
         let mut seen = vec![false; widths.len()];
         for rs in &supports {
             for &s in rs.support.iter().chain(std::iter::once(&rs.reg)) {
@@ -100,44 +101,12 @@ fn build_layout(machine: &PackedMachineProgram) -> Layout {
                 }
             }
         }
-        for s in 0..widths.len() {
-            if !seen[s] {
-                order.push(s);
-            }
-        }
-        let mut off = vec![0usize; widths.len()];
-        let mut cur = 0usize;
-        for &s in &order {
-            let sz = store_bytes(widths[s]);
-            cur = align(cur, sz);
-            off[s] = cur;
-            cur += sz;
-        }
-        cur = align(cur, 16);
-        let mut mem_base = Vec::new();
-        let mut mem_entry = Vec::new();
-        for m in &machine.source.memories {
-            let eb = store_bytes(m.data_layout.width);
-            cur = align(cur, eb);
-            mem_base.push(cur);
-            mem_entry.push(eb);
-            cur += eb * m.depth;
-        }
-        return Layout { off, mem_base, mem_entry, total: align(cur, 16) };
-    }
-    let mut off = vec![0usize; widths.len()];
-    let mut cur = 0usize;
-    // Place 16-byte slots first (offset 0 = 16-aligned), then 8/4/2/1 — each
-    // group starts at a multiple of its size, so all accesses are aligned.
-    for size in [16usize, 8, 4, 2, 1] {
-        for (i, w) in widths.iter().enumerate() {
-            if store_bytes(*w) == size {
-                off[i] = cur;
-                cur += size;
-            }
-        }
-    }
-    cur = align(cur, 16);
+        Some(order)
+    } else {
+        None
+    };
+    let (off, sig_region) = crate::packed_signal_layout(&widths, affinity_order.as_deref());
+    let mut cur = sig_region;
     let mut mem_base = Vec::new();
     let mut mem_entry = Vec::new();
     for m in &machine.source.memories {

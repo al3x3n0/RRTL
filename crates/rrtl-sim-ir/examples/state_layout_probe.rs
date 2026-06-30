@@ -9,70 +9,9 @@
 //!   - AFFINITY: per-width slots ordered so co-accessed signals are adjacent
 //!               (the NEW lever) — cluster each cone's support contiguously.
 //! Build: cargo run --release -p rrtl-sim-ir --example state_layout_probe -- [design.sv top]
-use rrtl_sim_ir::{lower_to_packed_program, register_support};
+use rrtl_sim_ir::{lower_to_packed_program, packed_signal_layout, register_support, state_store_bytes as store_bytes};
 use rrtl_sv_frontend::import_sv;
 use std::collections::HashSet;
-
-fn store_bytes(w: u32) -> usize {
-    match w {
-        0..=8 => 1,
-        9..=16 => 2,
-        17..=32 => 4,
-        33..=64 => 8,
-        _ => 16,
-    }
-}
-
-fn align(x: usize, a: usize) -> usize {
-    (x + a - 1) / a * a
-}
-
-/// Offsets for the current PACKED layout: each size class placed contiguously,
-/// largest first (naturally aligned, zero inter-slot padding).
-fn packed_offsets(widths: &[u32]) -> Vec<usize> {
-    let mut off = vec![0usize; widths.len()];
-    let mut cur = 0usize;
-    for size in [16usize, 8, 4, 2, 1] {
-        for (i, &w) in widths.iter().enumerate() {
-            if store_bytes(w) == size {
-                cur = align(cur, size);
-                off[i] = cur;
-                cur += size;
-            }
-        }
-    }
-    off
-}
-
-/// Offsets for the AFFINITY layout: visit cones in order, assign each cone's
-/// not-yet-placed signals contiguous (naturally-aligned) slots, so signals read
-/// together land on the same / adjacent cache lines.
-fn affinity_offsets(widths: &[u32], cones: &[Vec<usize>]) -> Vec<usize> {
-    let mut order: Vec<usize> = Vec::new();
-    let mut seen = vec![false; widths.len()];
-    for cone in cones {
-        for &s in cone {
-            if !seen[s] {
-                seen[s] = true;
-                order.push(s);
-            }
-        }
-    }
-    for s in 0..widths.len() {
-        if !seen[s] {
-            order.push(s);
-        }
-    }
-    let mut off = vec![0usize; widths.len()];
-    let mut cur = 0usize;
-    for &s in &order {
-        let sz = store_bytes(widths[s]);
-        cur = align(cur, sz);
-        off[s] = cur;
-        cur += sz;
-    }
-    off
-}
 
 const LINE: usize = 64;
 
@@ -111,9 +50,20 @@ fn run(path: &str, top: &str) {
     println!("[{top}] {n} signals ({w32} are 17-32 bit), {} register cones, avg cone fan-in {:.1}",
         cones.len(), cones.iter().map(|c| c.len()).sum::<usize>() as f64 / cones.len().max(1) as f64);
 
+    // Affinity order: each cone's signals, first-seen.
+    let mut affinity_order: Vec<usize> = Vec::new();
+    let mut seen = vec![false; n];
+    for cone in &cones {
+        for &s in cone {
+            if !seen[s] {
+                seen[s] = true;
+                affinity_order.push(s);
+            }
+        }
+    }
     let fat: Vec<usize> = (0..n).map(|i| i * 16).collect();
-    let packed = packed_offsets(&widths);
-    let affinity = affinity_offsets(&widths, &cones);
+    let (packed, _) = packed_signal_layout(&widths, None);
+    let (affinity, _) = packed_signal_layout(&widths, Some(&affinity_order));
     let bytes = |off: &[usize]| off.iter().zip(&widths).map(|(o, w)| o + store_bytes(*w)).max().unwrap_or(0);
 
     println!("  working set:  fat {:>6} B | packed {:>6} B ({:.2}x smaller) | affinity {:>6} B",

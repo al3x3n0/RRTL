@@ -917,6 +917,76 @@ pub fn cone_of_influence(
     (sig, mem)
 }
 
+/// The natural byte size that holds a signal of the given width: 1/2/4/8/16.
+pub fn state_store_bytes(width: u32) -> usize {
+    match width {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 4,
+        33..=64 => 8,
+        _ => 16,
+    }
+}
+
+/// Compute a **per-width-packed** state layout: each signal gets a slot of
+/// [`state_store_bytes`] bytes (vs a uniform 16-byte slot), shrinking the working
+/// set ~4–8× on width-heavy designs for far better cache density. Returns
+/// `(byte_offset_per_signal, total_bytes)` (total aligned to 16).
+///
+/// `affinity_order` optionally lists signal indices in the order they should be
+/// placed, so co-accessed signals (a register cone's support) land adjacent and
+/// share cache lines; remaining signals are appended. `None` packs by size class
+/// (largest first), which is naturally aligned with zero inter-slot padding.
+///
+/// This is the single source of truth for state packing across backends (the AOT
+/// uses it; the single-instance JIT's uniform `i*16`/`i*2` layout is a public
+/// contract — `JitSimulator::signal_word`/`state_words`, consumed by the
+/// partitioned/zero-copy batch harnesses — so adopting this there is a
+/// cross-cutting migration, tracked separately).
+pub fn packed_signal_layout(widths: &[u32], affinity_order: Option<&[usize]>) -> (Vec<usize>, usize) {
+    let align = |x: usize, a: usize| (x + a - 1) & !(a - 1);
+    let order: Vec<usize> = match affinity_order {
+        Some(o) => {
+            let mut seen = vec![false; widths.len()];
+            let mut ord = Vec::with_capacity(widths.len());
+            for &s in o {
+                if s < widths.len() && !seen[s] {
+                    seen[s] = true;
+                    ord.push(s);
+                }
+            }
+            for s in 0..widths.len() {
+                if !seen[s] {
+                    ord.push(s);
+                }
+            }
+            ord
+        }
+        None => {
+            // Size class largest-first: every class starts at a multiple of its
+            // size, so all slots are naturally aligned with zero padding.
+            let mut ord = Vec::with_capacity(widths.len());
+            for size in [16usize, 8, 4, 2, 1] {
+                for (s, &w) in widths.iter().enumerate() {
+                    if state_store_bytes(w) == size {
+                        ord.push(s);
+                    }
+                }
+            }
+            ord
+        }
+    };
+    let mut off = vec![0usize; widths.len()];
+    let mut cur = 0usize;
+    for &s in &order {
+        let sz = state_store_bytes(widths[s]);
+        cur = align(cur, sz);
+        off[s] = cur;
+        cur += sz;
+    }
+    (off, align(cur, 16))
+}
+
 fn remap_signal(old: usize, signal_map: &[Option<usize>]) -> Result<usize, ErrorReport> {
     signal_map[old].ok_or_else(|| slice_error(format!("unmapped signal index {old} in slice")))
 }
@@ -13127,6 +13197,31 @@ fn set_bit(value: &mut Vec<u32>, bit: Width) {
 mod tests {
     use super::*;
     use rrtl_core::{compile, concat, lit_s, lit_u, mux, sext, sint, uint, Design, Simulator};
+
+    // The shared per-width packer must place every signal in a non-overlapping,
+    // naturally-aligned slot, pack far below the uniform 16-byte layout, and honor
+    // an affinity order (placing listed signals first).
+    #[test]
+    fn packed_signal_layout_is_dense_aligned_and_ordered() {
+        let widths = [1u32, 32, 8, 64, 128, 16, 32];
+        let (off, total) = packed_signal_layout(&widths, None);
+        // each slot fits its store-bytes, is aligned, and none overlap
+        let mut spans: Vec<(usize, usize)> =
+            off.iter().zip(&widths).map(|(&o, &w)| (o, o + state_store_bytes(w))).collect();
+        for (i, &(o, _)) in spans.iter().enumerate() {
+            assert_eq!(o % state_store_bytes(widths[i]), 0, "signal {i} misaligned");
+            assert!(spans[i].1 <= total);
+        }
+        spans.sort_unstable();
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0, "overlap {:?} {:?}", w[0], w[1]);
+        }
+        // far denser than uniform 16-byte slots
+        assert!(total < widths.len() * 16);
+        // affinity order places the listed signals first (signal 6 then 2)
+        let (aoff, _) = packed_signal_layout(&widths, Some(&[6, 2]));
+        assert!(aoff[6] < aoff[2], "affinity order not honored");
+    }
 
     // The batch SIMD engine's clock-gated tick must match the gold oracle on an
     // independent multi-clock design (two counters on distinct clocks driven at
