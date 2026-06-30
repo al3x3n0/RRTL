@@ -41,6 +41,7 @@ pub use value_range::{block_maxbits, range_reduction_stats, RangeStats};
 
 pub mod activity;
 pub mod linearize;
+pub mod leap;
 pub mod gpu_codegen;
 pub use activity::{register_support, RegisterSupport};
 
