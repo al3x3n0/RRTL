@@ -43,6 +43,18 @@ name = "extsim_compare"
 [[example]]
 name = "sv_cpu_bench"
 
+[[example]]
+name = "bitslice_aot_bench"
+required-features = ["aot"]
+
+[[example]]
+name = "linear_aot_bench"
+required-features = ["aot"]
+
+[[example]]
+name = "hybrid_sim"
+required-features = ["aot"]
+
 [dev-dependencies]
 rrtl-sv-frontend = { path = "../rrtl-sv-frontend" }
 rrtl-riscv-asm = { path = "../rrtl-riscv-asm" }
