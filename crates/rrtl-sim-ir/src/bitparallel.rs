@@ -127,44 +127,51 @@ impl BitParallelSimulator {
 
     /// Evaluate a block into a fresh value workspace; returns the per-value-id
     /// word arrays so effects can read them.
-    fn eval_block(&self, block: &PackedBlock, work: &mut Vec<u64>, nvals: usize) {
+    fn eval_block(&self, block: &PackedBlock, work: &mut Vec<u64>, _nvals: usize) {
         // `work` is nvals*words; value `v` at `[v*words ..]`.
         for pkt in &block.packets {
-            for instr in &pkt.instrs {
-                let d = instr.dst.0 * self.words;
-                use PackedInstrKind::*;
-                match &instr.kind {
-                    Signal(s) => {
-                        let base = s * self.words;
-                        work[d..d + self.words].copy_from_slice(&self.state[base..base + self.words]);
-                    }
-                    Lit(w) => {
-                        // 1-bit literal: all-ones if bit 0 set, else all-zeros.
-                        let fill = if w.first().copied().unwrap_or(0) & 1 == 1 { u64::MAX } else { 0 };
-                        for k in 0..self.words {
-                            work[d + k] = fill;
-                        }
-                    }
-                    Not(a) => {
-                        let a = a.0 * self.words;
-                        for k in 0..self.words {
-                            work[d + k] = !work[a + k];
-                        }
-                    }
-                    And(a, b) => self.binop(work, d, a, b, |x, y| x & y),
-                    Or(a, b) => self.binop(work, d, a, b, |x, y| x | y),
-                    Xor(a, b) => self.binop(work, d, a, b, |x, y| x ^ y),
-                    Mux { cond, then_value, else_value } => {
-                        let (c, t, e) = (cond.0 * self.words, then_value.0 * self.words, else_value.0 * self.words);
-                        for k in 0..self.words {
-                            let cw = work[c + k];
-                            work[d + k] = (cw & work[t + k]) | (!cw & work[e + k]);
-                        }
-                    }
-                    _ => unreachable!("validated in new()"),
+            self.eval_packet(pkt, work);
+        }
+    }
+
+    /// Evaluate one packet's instructions into `work`. `Signal(s)` reads the
+    /// CURRENT `self.state`, so callers that settle a multi-packet comb chain must
+    /// apply each packet's stores before evaluating the next (the scheduler emits
+    /// comb packets in topological order).
+    fn eval_packet(&self, pkt: &crate::PackedMachinePacket, work: &mut [u64]) {
+        for instr in &pkt.instrs {
+            let d = instr.dst.0 * self.words;
+            use PackedInstrKind::*;
+            match &instr.kind {
+                Signal(s) => {
+                    let base = s * self.words;
+                    work[d..d + self.words].copy_from_slice(&self.state[base..base + self.words]);
                 }
+                Lit(w) => {
+                    // 1-bit literal: all-ones if bit 0 set, else all-zeros.
+                    let fill = if w.first().copied().unwrap_or(0) & 1 == 1 { u64::MAX } else { 0 };
+                    for k in 0..self.words {
+                        work[d + k] = fill;
+                    }
+                }
+                Not(a) => {
+                    let a = a.0 * self.words;
+                    for k in 0..self.words {
+                        work[d + k] = !work[a + k];
+                    }
+                }
+                And(a, b) => self.binop(work, d, a, b, |x, y| x & y),
+                Or(a, b) => self.binop(work, d, a, b, |x, y| x | y),
+                Xor(a, b) => self.binop(work, d, a, b, |x, y| x ^ y),
+                Mux { cond, then_value, else_value } => {
+                    let (c, t, e) = (cond.0 * self.words, then_value.0 * self.words, else_value.0 * self.words);
+                    for k in 0..self.words {
+                        let cw = work[c + k];
+                        work[d + k] = (cw & work[t + k]) | (!cw & work[e + k]);
+                    }
+                }
+                _ => unreachable!("validated in new()"),
             }
-            let _ = nvals;
         }
     }
 
@@ -212,10 +219,13 @@ impl BitParallelSimulator {
         for blk in [&self.machine.streams.async_reset_comb, &self.machine.streams.comb] {
             let nvals = Self::nvals(blk);
             let mut work = vec![0u64; nvals * self.words];
-            // SAFETY-free: eval reads self.state, writes work; then apply effects.
             let block = blk.clone();
-            self.eval_block(&block, &mut work, nvals);
+            // Evaluate each packet then apply ITS stores before the next packet, so
+            // a later packet's `Signal(wire)` sees the wire its predecessor stored
+            // (multi-level comb-wire chains, e.g. from a gate netlist). Packets are
+            // in topological order.
             for pkt in &block.packets {
+                self.eval_packet(pkt, &mut work);
                 for eff in &pkt.effects {
                     match eff {
                         PackedEffect::StoreSignal { dst, value } => {
@@ -468,6 +478,52 @@ mod tests {
     use super::*;
     use crate::{lower_to_machine_program, lower_to_packed_program, SimdCpuSimulator};
     use rrtl_core::{compile, uint, Design};
+
+    // A multi-level COMB-WIRE CHAIN feeding a register (w1 = a&b; w2 = w1^q;
+    // q <= w2) — the shape a gate netlist produces. The settle must propagate
+    // w1's store before w2 reads it, so bit-parallel must match the SIMD CPU.
+    #[test]
+    fn bitparallel_comb_wire_chain_matches_simd_cpu() {
+        let mut design = Design::new();
+        {
+            let mut m = design.module("Chain");
+            let clk = m.input("clk", uint(1));
+            let a = m.input("a", uint(1));
+            let b = m.input("b", uint(1));
+            let q = m.reg("q", uint(1));
+            let w1 = m.wire("w1", uint(1));
+            let w2 = m.wire("w2", uint(1));
+            m.clock(q, clk);
+            m.assign(w1, a.value() & b.value());
+            m.assign(w2, w1.value() ^ q.value());
+            m.next(q, w2.value());
+            let o = m.output("o", uint(1));
+            m.assign(o, q.value());
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Chain").unwrap();
+        let machine = lower_to_machine_program(&program);
+        let h = |n: &str| compiled.find_module("Chain").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+        let lanes = 100;
+        let mut bp = BitParallelSimulator::new(&machine, lanes).unwrap();
+        let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
+        cpu.set_signal(h("clk"), &vec![1u128; lanes]).unwrap();
+        for l in 0..lanes {
+            bp.set_signal(program.signal_index(h("clk")).unwrap(), l, true);
+            bp.set_signal(program.signal_index(h("a")).unwrap(), l, l % 2 == 0);
+            bp.set_signal(program.signal_index(h("b")).unwrap(), l, l % 3 == 0);
+        }
+        cpu.set_signal(h("a"), &(0..lanes).map(|l| (l % 2 == 0) as u128).collect::<Vec<_>>()).unwrap();
+        cpu.set_signal(h("b"), &(0..lanes).map(|l| (l % 3 == 0) as u128).collect::<Vec<_>>()).unwrap();
+        for cyc in 0..16 {
+            bp.tick();
+            cpu.tick().unwrap();
+            let cv = cpu.get_signal(h("o")).unwrap();
+            for l in 0..lanes {
+                assert_eq!(bp.get_signal(program.signal_index(h("o")).unwrap(), l), cv[l] & 1 == 1, "o@lane{l} cyc{cyc}");
+            }
+        }
+    }
 
     // A small gate-level netlist (all 1-bit, NAND/NOR/XNOR) must match the SIMD
     // CPU engine on every output of every lane.

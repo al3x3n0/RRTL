@@ -1,16 +1,12 @@
-//! Import a gate-level (Yosys-JSON) netlist and run it batched — the link from
-//! "any synthesized design" (Yosys `synth; abc; write_json`) to RRTL's batch
-//! engines. All nets are 1-bit, so the design is also bit-parallel-eligible (the
-//! ~96×-Verilator gate-level moat); we run it on the verified SIMD CPU batch
-//! engine here and check every lane bit-exact against the scalar oracle.
-//!
-//! NOTE: the bit-parallel *interp* currently mis-settles the multi-level comb-
-//! wire chains a netlist produces (gate-by-gate `n4 = a&b; n6 = n4^q; reg <= n6`)
-//! — it captures the register from a not-yet-settled wire. The hand-written gate
-//! benches use inline exprs and never hit it; importing exposes the gap. Tracked
-//! separately; the SIMD/JIT/AOT batch engines settle the chains correctly.
+//! Import a gate-level (Yosys-JSON) netlist and run it on the bit-parallel batch
+//! engine — the concrete link from "any synthesized design" (Yosys
+//! `synth; abc; write_json`) to RRTL's ~96×-Verilator gate-level moat. All nets
+//! are 1-bit, so BitParallelSimulator applies directly; checked bit-exact vs the
+//! scalar oracle. (The multi-level comb-wire chains a netlist produces now settle
+//! correctly — the interp applies each comb packet's stores before the next.)
 //! Build: cargo run --release -p rrtl-sim-ir --example netlist_batch
-use rrtl_sim_ir::{lower_to_packed_program, SimdCpuSimulator};
+use rrtl_sim_ir::bitparallel::BitParallelSimulator;
+use rrtl_sim_ir::{lower_to_machine_program, lower_to_packed_program};
 use rrtl_sv_frontend::import_yosys_netlist;
 
 fn main() {
@@ -31,16 +27,19 @@ fn main() {
     let design = import_yosys_netlist(json, "acc1").expect("import netlist");
     let compiled = rrtl_core::compile(&design).expect("compile");
     let program = lower_to_packed_program(&compiled, "acc1").expect("lower");
+    let machine = lower_to_machine_program(&program);
     let h = |n: &str| compiled.find_module("acc1").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+    let idx = |n: &str| program.signal_index(h(n)).unwrap();
     let lanes = 256;
 
-    let mut cpu = SimdCpuSimulator::new(program.clone(), lanes).unwrap();
-    cpu.set_signal(h("clk"), &vec![1u128; lanes]).unwrap();
+    let mut bp = BitParallelSimulator::new(&machine, lanes).expect("gate-level → bit-parallel");
     let av: Vec<u128> = (0..lanes).map(|l| (l % 2) as u128).collect();
     let bv: Vec<u128> = (0..lanes).map(|l| ((l / 2) % 2) as u128).collect();
-    cpu.set_signal(h("a"), &av).unwrap();
-    cpu.set_signal(h("b"), &bv).unwrap();
-
+    for l in 0..lanes {
+        bp.set_signal(idx("clk"), l, true);
+        bp.set_signal(idx("a"), l, av[l] != 0);
+        bp.set_signal(idx("b"), l, bv[l] != 0);
+    }
     // ground-truth scalar oracle per distinct input combo
     let mut scal: Vec<rrtl_core::Simulator> = (0..lanes)
         .map(|l| {
@@ -54,16 +53,15 @@ fn main() {
 
     let mut mism = 0;
     for _ in 0..32 {
-        cpu.tick().unwrap();
-        let cq = cpu.get_signal(h("q")).unwrap();
+        bp.tick();
         for l in 0..lanes {
             scal[l].tick();
-            if (cq[l] & 1) != (scal[l].get(h("q")) & 1) {
+            if (bp.get_signal(idx("q"), l) as u128) != (scal[l].get(h("q")) & 1) {
                 mism += 1;
             }
         }
     }
-    println!("imported gate netlist `acc1` ({} nets) → SIMD CPU batch, {lanes} lanes × 32 cyc", program.signals.len());
-    println!("  batch vs scalar oracle (per lane): {}", if mism == 0 { "BIT-EXACT" } else { "MISMATCH" });
+    println!("imported gate netlist `acc1` ({} nets) → BIT-PARALLEL batch, {lanes} lanes × 32 cyc", program.signals.len());
+    println!("  bit-parallel vs scalar oracle (per lane): {}", if mism == 0 { "BIT-EXACT" } else { "MISMATCH" });
     assert_eq!(mism, 0);
 }
