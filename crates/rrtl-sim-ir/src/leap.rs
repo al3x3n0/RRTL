@@ -80,6 +80,12 @@ pub struct LinearLeap {
     state_bits: usize,
     m: Gf2Mat, // homogeneous transition (din=0, constant excluded)
     c: u128,   // per-idle-cycle constant (state bits)
+    // Input contribution: c_u = B·u ⊕ c maps a held input vector u to the
+    // per-cycle constant offset (nonzero-constant-input leap).
+    b: Gf2Mat,                          // state_bits rows × input_bits
+    input_leaves: Vec<(usize, u32)>,    // (input signal index, width)
+    input_base: HashMap<usize, usize>,  // input signal -> bit offset in u
+    input_bits: usize,
 }
 
 impl LinearLeap {
@@ -108,7 +114,21 @@ impl LinearLeap {
         if state_bits > 128 {
             return None;
         }
+        // Input-leaf layout: any leaf that is not a tracked register is an input.
+        let mut input_base = HashMap::new();
+        let mut input_leaves: Vec<(usize, u32)> = Vec::new();
+        let mut input_bits = 0usize;
+        for (_, _, form) in &regs {
+            for &(sig, w) in &form.leaves {
+                if !base.contains_key(&sig) && !input_base.contains_key(&sig) {
+                    input_base.insert(sig, input_bits);
+                    input_leaves.push((sig, w));
+                    input_bits += w as usize;
+                }
+            }
+        }
         let mut rows = vec![0u128; state_bits];
+        let mut b_rows = vec![0u128; state_bits];
         let mut c = 0u128;
         for (dst, w, form) in &regs {
             let mut leaf_col = HashMap::new();
@@ -118,17 +138,21 @@ impl LinearLeap {
                 col += lw as usize;
             }
             for i in 0..*w as usize {
-                let mut row = 0u128;
-                for (d2, w2, _) in &regs {
-                    if let Some(&lc) = leaf_col.get(d2) {
-                        for j in 0..*w2 as usize {
-                            if (form.columns[lc + j] >> i) & 1 == 1 {
-                                row |= 1u128 << (base[d2] + j);
+                let (mut row, mut brow) = (0u128, 0u128);
+                for &(sig, lw) in &form.leaves {
+                    let lc = leaf_col[&sig];
+                    for j in 0..lw as usize {
+                        if (form.columns[lc + j] >> i) & 1 == 1 {
+                            if let Some(&sb) = base.get(&sig) {
+                                row |= 1u128 << (sb + j); // state→state (M)
+                            } else {
+                                brow |= 1u128 << (input_base[&sig] + j); // input→state (B)
                             }
                         }
                     }
                 }
                 rows[base[dst] + i] = row;
+                b_rows[base[dst] + i] = brow;
             }
             let mask = if *w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
             c |= (form.constant & mask) << base[dst];
@@ -139,6 +163,10 @@ impl LinearLeap {
             state_bits,
             m: Gf2Mat { rows, n: state_bits },
             c,
+            b: Gf2Mat { rows: b_rows, n: input_bits.max(1) },
+            input_leaves,
+            input_base,
+            input_bits,
         })
     }
 
@@ -189,6 +217,48 @@ impl LinearLeap {
     /// State after `n` idle cycles (inputs at zero): `M^N·s0 ⊕ (Σ M^k)·c`, O(log N).
     pub fn leap_idle(&self, s0: u128, n: u64) -> u128 {
         self.apply_idle(&self.idle_operator(n), s0)
+    }
+
+    /// Input leaves (non-register signals the linear cones read) and their bit
+    /// offset in the input vector `u`.
+    pub fn input_leaves(&self) -> &[(usize, u32)] {
+        &self.input_leaves
+    }
+    pub fn input_bit_base(&self, sig: usize) -> Option<usize> {
+        self.input_base.get(&sig).copied()
+    }
+    /// Total width of the input vector `u` (sum of input-leaf widths).
+    pub fn input_bits(&self) -> usize {
+        self.input_bits
+    }
+
+    /// The per-cycle constant offset when the input is held at `u`:
+    /// `c_u = B·u ⊕ c`.
+    pub fn input_constant(&self, u: u128) -> u128 {
+        self.b.apply(u) ^ self.c
+    }
+
+    /// The N-cycle operators `(M^N, G_N = Σ_{k<N} M^k)` via the block matrix
+    /// `[[M, I],[0, I]]^N = [[M^N, G_N],[0, I]]`. Then for a held input `u`,
+    /// `s(N) = M^N·s0 ⊕ G_N·c_u` with `c_u = `[`input_constant`](Self::input_constant)`(u)`
+    /// — the **nonzero-constant-input** leap. `None` if `2·state_bits > 128`.
+    pub fn leap_operators(&self, n: u64) -> Option<(Gf2Mat, Gf2Mat)> {
+        let sb = self.state_bits;
+        if 2 * sb > 128 {
+            return None;
+        }
+        let mut rows = vec![0u128; 2 * sb];
+        for i in 0..sb {
+            rows[i] = self.m.rows[i] | (1u128 << (sb + i)); // [M | I]
+        }
+        for j in 0..sb {
+            rows[sb + j] = 1u128 << (sb + j); // [0 | I]
+        }
+        let bn = (Gf2Mat { rows, n: 2 * sb }).pow(n);
+        let lo = if sb >= 128 { u128::MAX } else { (1u128 << sb) - 1 };
+        let mn = Gf2Mat { rows: (0..sb).map(|i| bn.rows[i] & lo).collect(), n: sb };
+        let gn = Gf2Mat { rows: (0..sb).map(|i| (bn.rows[i] >> sb) & lo).collect(), n: sb };
+        Some((mn, gn))
     }
 
     /// Combine `P` equal-length segment results (each the segment processed from

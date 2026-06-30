@@ -387,19 +387,37 @@ impl HybridSimulator {
         if self.coupled {
             return self.tick_many(n as usize);
         }
-        // Build the n-cycle operator once; apply M^n to every lane's linear state.
-        let op = self.leap.idle_operator(n);
-        let regs: Vec<(usize, u32)> = self.leap.registers().to_vec();
+        // (dst, mask, state-bit-base) per linear register — captured so the
+        // per-lane loop touches only `self.lin` (no borrow of `self.leap`).
+        let regs_b: Vec<(usize, u128, usize)> = self
+            .leap
+            .registers()
+            .iter()
+            .map(|&(dst, w)| (dst, if w >= 128 { u128::MAX } else { (1u128 << w) - 1 }, self.leap.bit_base(dst).unwrap()))
+            .collect();
+        // Nonzero-constant-input leap when the state fits (2·bits ≤ 128): read
+        // each lane's HELD inputs, form its per-cycle constant c_u, and jump
+        // s(N) = M^N·s0 ⊕ G_N·c_u. Falls back to the zero-input idle operator
+        // (valid only when inputs are held at zero) for wider state.
+        let const_ops = self.leap.leap_operators(n);
+        let idle_op = if const_ops.is_none() { Some(self.leap.idle_operator(n)) } else { None };
+        let inputs_b: Vec<(usize, usize)> =
+            self.leap.input_leaves().iter().map(|&(s, _)| (s, self.leap.input_bit_base(s).unwrap())).collect();
         for lane in 0..self.lanes {
-            let mut s = 0u128;
-            for &(dst, _) in &regs {
-                let base = self.leap.bit_base(dst).unwrap();
-                s |= self.lin.get_signal(dst, lane) << base;
+            let mut s0 = 0u128;
+            for &(dst, _, base) in &regs_b {
+                s0 |= self.lin.get_signal(dst, lane) << base;
             }
-            let s2 = self.leap.apply_idle(&op, s);
-            for &(dst, w) in &regs {
-                let base = self.leap.bit_base(dst).unwrap();
-                let mask = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+            let s2 = if let Some((mn, gn)) = &const_ops {
+                let mut u = 0u128;
+                for &(sig, ibase) in &inputs_b {
+                    u |= self.lin.get_signal(sig, lane) << ibase;
+                }
+                mn.apply(s0) ^ gn.apply(self.leap.input_constant(u))
+            } else {
+                self.leap.apply_idle(idle_op.as_ref().unwrap(), s0)
+            };
+            for &(dst, mask, base) in &regs_b {
                 self.lin.set_signal(dst, lane, (s2 >> base) & mask);
             }
         }
@@ -486,8 +504,9 @@ mod tests {
         }
     }
 
-    // leap(n) must equal tick_many(n) when the linear partition (crc) is idle
-    // (din held 0): crc jumps via M^n, acc/count step. mixed is independent.
+    // leap(n) must equal tick_many(n) when the linear partition's inputs are held
+    // CONSTANT (here din at a per-lane nonzero value): crc jumps via M^n s0 ⊕
+    // G_n c_u, acc/count step. Exercises the nonzero-constant-input leap.
     #[test]
     fn hybrid_leap_matches_tick_many_idle() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/sv/mixed.sv")).unwrap();
@@ -512,6 +531,8 @@ mod tests {
             s.set_signal(h("b"), &b).unwrap();
             s.tick().unwrap();
             s.set_signal(h("rst"), &vec![0u128; lanes]).unwrap();
+            // hold din at a per-lane NONZERO constant (constant-input leap)
+            s.set_signal(h("din"), &(0..lanes).map(|l| (l as u128 * 31 + 17) & 0xff).collect::<Vec<_>>()).unwrap();
         }
         let n = 100_000u64;
         stepped.tick_many(n as usize).unwrap();
