@@ -2,11 +2,13 @@ use rrtl_ir::{Diagnostic, ErrorReport};
 
 mod ast;
 mod lower;
+pub mod netlist;
 mod parser;
 mod preprocess;
 
 pub use ast::*;
 pub use lower::import_source;
+pub use netlist::import_yosys_netlist;
 
 use lower::specialize_source;
 use parser::Parser;
