@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use rrtl_ir::{Diagnostic, ErrorReport, Signal};
 
+use crate::leap::LinearLeap;
 use crate::linear_aot::LinearAot;
 use crate::{
     cone_of_influence, slice_present, PackedExpr, PackedExprKind, PackedOp, PackedProgram,
@@ -169,6 +170,7 @@ pub struct HybridSimulator {
     gen_from_lin: Vec<(usize, usize)>,  // (general local boundary input, linear reg global)
     lin_from_general: Vec<(usize, usize)>, // (linear-leaf global, general local owning it)
     coupled: bool,
+    leap: LinearLeap, // temporal-leap operator for the linear partition
     lanes: usize,
 }
 
@@ -254,6 +256,8 @@ impl HybridSimulator {
             ));
         }
 
+        let leap = LinearLeap::build(program)
+            .ok_or_else(|| hyb_err("no linear register cones to build a leap operator"))?;
         Ok(Self {
             program: program.clone(),
             lin,
@@ -266,6 +270,7 @@ impl HybridSimulator {
             gen_from_lin,
             lin_from_general,
             coupled,
+            leap,
             lanes,
         })
     }
@@ -370,6 +375,36 @@ impl HybridSimulator {
     pub fn is_coupled(&self) -> bool {
         self.coupled
     }
+
+    /// Advance `n` cycles by TEMPORAL LEAP: the (independent) linear partition is
+    /// jumped `n` cycles via `M^n` in O(log n) matrix mults instead of n steps,
+    /// while the non-linear partition steps normally. Bit-identical to
+    /// `tick_many(n)` **when the linear partition's inputs are held idle (zero)
+    /// over the n cycles** — its natural domain (free-running LFSR/scrambler/
+    /// counter/CRC-between-feeds). Falls back to `tick_many` when the partitions
+    /// are coupled (the linear inputs then vary with the non-linear state).
+    pub fn leap(&mut self, n: u64) -> Result<(), ErrorReport> {
+        if self.coupled {
+            return self.tick_many(n as usize);
+        }
+        // Build the n-cycle operator once; apply M^n to every lane's linear state.
+        let op = self.leap.idle_operator(n);
+        let regs: Vec<(usize, u32)> = self.leap.registers().to_vec();
+        for lane in 0..self.lanes {
+            let mut s = 0u128;
+            for &(dst, _) in &regs {
+                let base = self.leap.bit_base(dst).unwrap();
+                s |= self.lin.get_signal(dst, lane) << base;
+            }
+            let s2 = self.leap.apply_idle(&op, s);
+            for &(dst, w) in &regs {
+                let base = self.leap.bit_base(dst).unwrap();
+                let mask = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+                self.lin.set_signal(dst, lane, (s2 >> base) & mask);
+            }
+        }
+        self.nl.tick_many(n as usize)
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +483,41 @@ mod tests {
                 let hv = hyb.get_signal(h(out)).unwrap();
                 assert_eq!(hv, fv, "{out} @ cyc{cyc}");
             }
+        }
+    }
+
+    // leap(n) must equal tick_many(n) when the linear partition (crc) is idle
+    // (din held 0): crc jumps via M^n, acc/count step. mixed is independent.
+    #[test]
+    fn hybrid_leap_matches_tick_many_idle() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/sv/mixed.sv")).unwrap();
+        let imported = import_sv(&src, Some("mixed")).unwrap();
+        let compiled = rrtl_core::compile(&imported.design).unwrap();
+        let program = lower_to_packed_program(&compiled, "mixed").unwrap();
+        let h = |n: &str| compiled.find_module("mixed").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+        let lanes = 64;
+
+        let mut leaped = HybridSimulator::new(&program, lanes).unwrap();
+        let mut stepped = HybridSimulator::new(&program, lanes).unwrap();
+        assert!(!leaped.is_coupled());
+        let clk = vec![1u128; lanes];
+        let a: Vec<u128> = (0..lanes).map(|l| (l as u128 * 13 + 1) & 0xffff).collect();
+        let b: Vec<u128> = (0..lanes).map(|l| (l as u128 * 7 + 5) & 0xffff).collect();
+        for s in [&mut leaped, &mut stepped] {
+            s.set_signal(h("clk"), &clk).unwrap();
+            // reset once to seed crc=FFFFFFFF, then idle (din=0), a/b held.
+            s.set_signal(h("rst"), &vec![1u128; lanes]).unwrap();
+            s.set_signal(h("din"), &vec![0u128; lanes]).unwrap();
+            s.set_signal(h("a"), &a).unwrap();
+            s.set_signal(h("b"), &b).unwrap();
+            s.tick().unwrap();
+            s.set_signal(h("rst"), &vec![0u128; lanes]).unwrap();
+        }
+        let n = 100_000u64;
+        stepped.tick_many(n as usize).unwrap();
+        leaped.leap(n).unwrap();
+        for out in ["crc", "acc", "count"] {
+            assert_eq!(leaped.get_signal(h(out)).unwrap(), stepped.get_signal(h(out)).unwrap(), "{out} after leap({n})");
         }
     }
 }

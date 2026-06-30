@@ -156,14 +156,15 @@ impl LinearLeap {
         &self.m
     }
 
-    /// State after `n` idle cycles (inputs held at zero / the cone's constant):
-    /// `M^N·s0 ⊕ (Σ_{k<N} M^k)·c`, via an augmented matrix exponentiated by
-    /// squaring — O(log N). Requires `state_bits ≤ 127` (one augmented bit).
-    pub fn leap_idle(&self, s0: u128, n: u64) -> u128 {
+    /// The N-cycle idle-evolution operator `A^N` (augmented with the per-cycle
+    /// constant) — built once, then applied to many states / lanes via
+    /// [`Self::apply_idle`]. O(log N) matmuls. Requires `state_bits ≤ 127`
+    /// (one augmented bit); for a 128-bit state it returns the homogeneous `M^N`
+    /// (valid only when the constant is zero).
+    pub fn idle_operator(&self, n: u64) -> Gf2Mat {
         if self.state_bits >= 128 {
-            // can't augment; fall back to homogeneous (valid only when c == 0)
             debug_assert_eq!(self.c, 0);
-            return self.m.pow(n).apply(s0);
+            return self.m.pow(n);
         }
         let aug = self.state_bits;
         let mut rows = self.m.rows.clone();
@@ -173,9 +174,21 @@ impl LinearLeap {
             }
         }
         rows.push(1u128 << aug);
-        let a = Gf2Mat { rows, n: aug + 1 };
-        let v = a.pow(n).apply(s0 | (1u128 << aug));
-        v & ((1u128 << aug) - 1)
+        Gf2Mat { rows, n: aug + 1 }.pow(n)
+    }
+
+    /// Apply an [`Self::idle_operator`] to one state vector.
+    pub fn apply_idle(&self, op: &Gf2Mat, s0: u128) -> u128 {
+        if self.state_bits >= 128 {
+            return op.apply(s0);
+        }
+        let aug = self.state_bits;
+        op.apply(s0 | (1u128 << aug)) & ((1u128 << aug) - 1)
+    }
+
+    /// State after `n` idle cycles (inputs at zero): `M^N·s0 ⊕ (Σ M^k)·c`, O(log N).
+    pub fn leap_idle(&self, s0: u128, n: u64) -> u128 {
+        self.apply_idle(&self.idle_operator(n), s0)
     }
 
     /// Combine `P` equal-length segment results (each the segment processed from
