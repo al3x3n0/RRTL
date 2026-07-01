@@ -805,6 +805,12 @@ pub struct AotSimulator {
 impl AotSimulator {
     /// Generate C, compile it with `$CC` (default `clang`) at `-O3`, load it.
     pub fn compile(machine: &PackedMachineProgram) -> Result<Self, ErrorReport> {
+        Self::build(machine, &[], "")
+    }
+
+    /// Compile with extra clang flags (e.g. PGO instrumentation/use); `suffix`
+    /// distinguishes the temp lib so several variants of the same design coexist.
+    fn build(machine: &PackedMachineProgram, extra: &[String], suffix: &str) -> Result<Self, ErrorReport> {
         let c = generate_c(machine)?;
         let num_signals = machine.source.signals.len();
         let widths: Vec<u32> = machine.source.signals.iter().map(|s| s.layout.width).collect();
@@ -814,17 +820,16 @@ impl AotSimulator {
         let stamp = format!("{:x}", fxhash(c.as_bytes()));
         let dir = std::env::temp_dir();
         let cpath = dir.join(format!("rrtl_aot_{stamp}.c"));
-        let libname = format!("librrtl_aot_{stamp}.{}", dylib_ext());
+        let libname = format!("librrtl_aot_{stamp}{suffix}.{}", dylib_ext());
         let libpath = dir.join(&libname);
         std::fs::write(&cpath, &c).map_err(|e| aot_err(format!("write C: {e}")))?;
 
         let cc = std::env::var("CC").unwrap_or_else(|_| "clang".into());
-        let out = std::process::Command::new(&cc)
-            .args(["-O3", "-shared", "-fPIC", "-o"])
-            .arg(&libpath)
-            .arg(&cpath)
-            .output()
-            .map_err(|e| aot_err(format!("spawn {cc}: {e}")))?;
+        let mut cmd = std::process::Command::new(&cc);
+        cmd.arg("-O3");
+        cmd.args(extra);
+        cmd.args(["-shared", "-fPIC", "-o"]).arg(&libpath).arg(&cpath);
+        let out = cmd.output().map_err(|e| aot_err(format!("spawn {cc}: {e}")))?;
         if !out.status.success() {
             return Err(aot_err(format!(
                 "{cc} -O3 failed: {}",
@@ -897,6 +902,65 @@ impl AotSimulator {
             widths,
             num_signals,
         })
+    }
+
+    /// Profile-guided build: (1) compile an instrumented lib
+    /// (`-fprofile-generate`), (2) run the caller's `profile` workload on it,
+    /// (3) flush + `llvm-profdata merge`, (4) recompile with `-fprofile-use` so
+    /// clang lays out branches/inlining for the observed hot paths. The `profile`
+    /// closure should drive representative stimulus + `tick_many` on the given
+    /// (instrumented) simulator. Falls back to a plain `-O3` build if the profile
+    /// data is empty or `llvm-profdata` is unavailable.
+    pub fn compile_pgo<F: FnOnce(&mut AotSimulator)>(
+        machine: &PackedMachineProgram,
+        profile: F,
+    ) -> Result<Self, ErrorReport> {
+        let c = generate_c(machine)?;
+        let stamp = format!("{:x}", fxhash(c.as_bytes()));
+        let profdir = std::env::temp_dir().join(format!("rrtl_pgo_{stamp}"));
+        let _ = std::fs::remove_dir_all(&profdir);
+        std::fs::create_dir_all(&profdir).map_err(|e| aot_err(format!("mkdir profdir: {e}")))?;
+        let raw = profdir.join("rrtl.profraw");
+        // profile runtime writes to LLVM_PROFILE_FILE on flush; set before dlopen.
+        std::env::set_var("LLVM_PROFILE_FILE", &raw);
+
+        // 1. instrumented build + 2. profile run.
+        let mut instr = Self::build(machine, &[format!("-fprofile-generate={}", profdir.display())], "_instr")?;
+        profile(&mut instr);
+        // 3. flush the counters to disk, then unload.
+        unsafe {
+            if let Ok(write) = instr._lib.get::<extern "C" fn() -> i32>(b"__llvm_profile_write_file") {
+                write();
+            }
+        }
+        drop(instr);
+
+        // merge raw → profdata (Apple clang ships llvm-profdata via `xcrun`).
+        let profdata = profdir.join("merged.profdata");
+        let raws: Vec<_> = std::fs::read_dir(&profdir)
+            .map_err(|e| aot_err(format!("read profdir: {e}")))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map_or(false, |x| x == "profraw"))
+            .collect();
+        if raws.is_empty() {
+            return Self::compile(machine); // no profile → plain -O3
+        }
+        let mut merge = std::process::Command::new("xcrun");
+        merge.args(["llvm-profdata", "merge", "-o"]).arg(&profdata).args(&raws);
+        let m = merge.output();
+        let merged_ok = m.as_ref().map(|o| o.status.success()).unwrap_or(false)
+            || {
+                // fall back to a bare `llvm-profdata` on PATH
+                std::process::Command::new("llvm-profdata")
+                    .args(["merge", "-o"]).arg(&profdata).args(&raws)
+                    .output().map(|o| o.status.success()).unwrap_or(false)
+            };
+        if !merged_ok {
+            return Self::compile(machine); // no profdata tool → plain -O3
+        }
+
+        // 4. profile-use build.
+        Self::build(machine, &[format!("-fprofile-use={}", profdata.display())], "_pgo")
     }
 
     fn state_ptr(&mut self) -> *mut u8 {
@@ -1002,6 +1066,52 @@ mod tests {
     use crate::{lower_to_machine_program, lower_to_packed_program};
     use rrtl_core::{compile, Design, Signal, Simulator};
     use rrtl_ir::{lit_u, uint};
+
+    // The profile-guided build (instrument → run → merge → -fprofile-use) must be
+    // bit-identical to the plain -O3 build (PGO changes layout, not semantics).
+    #[test]
+    fn aot_pgo_matches_plain() {
+        use rrtl_ir::mux;
+        let mut design = Design::new();
+        {
+            let mut m = design.module("Acc");
+            let clk = m.input("clk", uint(1));
+            let en = m.input("en", uint(8));
+            let a = m.input("a", uint(8));
+            let acc = m.reg("acc", uint(8));
+            m.clock(acc, clk);
+            m.next(acc, mux(en.value().slice(0, 1), acc.value() + a.value(), acc.value() ^ a.value()));
+            let o = m.output("o", uint(8));
+            m.assign(o, acc.value());
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Acc").unwrap();
+        let machine = lower_to_machine_program(&program);
+        let h = |n: &str| compiled.find_module("Acc").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+        let idx = |n: &str| program.signal_index(h(n)).unwrap();
+        let (clk, en, a, o) = (idx("clk"), idx("en"), idx("a"), idx("o"));
+
+        let mut plain = AotSimulator::compile(&machine).unwrap();
+        let mut pgo = AotSimulator::compile_pgo(&machine, |sim| {
+            sim.set_signal(clk, 1);
+            for c in 0..500u64 {
+                sim.set_signal(en, c & 1);
+                sim.set_signal(a, c & 0xff);
+                sim.tick_many(1);
+            }
+        })
+        .unwrap();
+        plain.set_signal(clk, 1);
+        pgo.set_signal(clk, 1);
+        for c in 0..300u64 {
+            for s in [&mut plain, &mut pgo] {
+                s.set_signal(en, (c >> 1) & 1);
+                s.set_signal(a, (c * 7 + 3) & 0xff);
+                s.tick_many(1);
+            }
+            assert_eq!(plain.get_signal(o), pgo.get_signal(o), "PGO != plain @ cyc{c}");
+        }
+    }
 
     // The AOT (clang -O3) clock-gated tick must match the gold oracle on an
     // independent multi-clock design — the compiled C mirror of the JIT select.

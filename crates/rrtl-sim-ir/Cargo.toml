@@ -52,6 +52,10 @@ name = "linear_aot_bench"
 required-features = ["aot"]
 
 [[example]]
+name = "aot_pgo"
+required-features = ["aot"]
+
+[[example]]
 name = "hybrid_sim"
 required-features = ["aot"]
 
