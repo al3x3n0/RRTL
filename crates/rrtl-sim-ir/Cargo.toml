@@ -56,6 +56,10 @@ name = "aot_pgo"
 required-features = ["aot"]
 
 [[example]]
+name = "aot_fusion_probe"
+required-features = ["aot"]
+
+[[example]]
 name = "hybrid_sim"
 required-features = ["aot"]
 
