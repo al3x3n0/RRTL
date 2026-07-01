@@ -1424,6 +1424,28 @@ so the deliverable is correctness, not a throttle-sensitive throughput claim. Th
 §4g.4b's unchanged: 64 lanes ride in one u64, so the P-fault sweep costs one fault-free simulation's work —
 which is exactly why serial fault simulators are slow and why the batch moat is the right tool for the job.
 
+**At scale, on a real core.** The same campaign runs on the synthesized **picorv32** netlist — 11,735 cells,
+**1,597 flops → 3,194 stuck-at faults graded in one 3,195-lane batch** (`examples/fault_sim_picorv32.rs`).
+Here coverage is genuinely partial, and *that is the interesting result*: it depends on the stimulus's ability
+to excite a fault, propagate it, and let it reach an observed output (the 71-bit memory interface). Feeding the
+core three different fixed instruction streams for 400 cycles each, golden bit-exact throughout:
+
+| stimulus (400 cyc, 71 observed bus bits) | coverage | detection latency (min/max/mean cyc) |
+|---|---|---|
+| random 32-bit words | 5.3% (169/3194) | 1 / 10 / 5.2 |
+| `addi`-only (compute, no memory traffic) | 4.7% (151/3194) | 1 / 390 / 14.4 |
+| compute-**and-store** loop (`sw` exposes the accumulator) | **20.3% (648/3194)** | 1 / 224 / 37.0 |
+
+The jump from ~5% to 20% when the program *stores* its computed values is the mechanism validating itself:
+random words trap the decoder into a near-quiescent state; `addi`-only keeps the core running but nothing
+computed ever reaches the bus, so only fetch/PC/control faults (~150) are observable; adding a `sw` drives the
+accumulator onto `mem_wdata`, and register-file/ALU faults *deep in the datapath* become detectable — the
+latency climbs to a 224-cycle tail as those faults propagate across many cycles before surfacing. Coverage
+that **responds to observability this way is the signature of a real fault simulator**, not an output mask, and
+it connects directly to the observability-slicing story (§4j): what you observe determines what you can grade.
+None of these are ATPG-grade test sets — they are three-line toy stimuli — but they grade *all* 3,194 faults in
+a single batch sweep, which is the point: the moat turns "3,194 fault simulations" into one.
+
 ## 4h. Measured against Verilator and PyRTL
 
 The JIT claims are only meaningful against the reference tools. We benchmark RRTL vs
