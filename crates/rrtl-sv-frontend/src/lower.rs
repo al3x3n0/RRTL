@@ -651,7 +651,7 @@ fn lower_module(
     }
     let items = expand_generate_items(&module.items, &consts)?;
     let items = expand_functions(items)?; // inline function calls, drop defs
-    let ff_targets = always_ff_signal_targets(&items);
+    let ff_targets = always_ff_register_targets(&items);
     let mut occupied_names = module_signal_names(&items);
     for item in &items {
         match item {
@@ -787,7 +787,7 @@ fn lower_module(
                 lower_always_comb(stmts, &symbols, &consts, &mut builder)?;
             }
             SvItem::AlwaysFf(always) => {
-                lower_always_ff(always, &symbols, &consts, &mut builder)?;
+                lower_always_ff(always, &symbols, &consts, &ff_targets, &mut builder)?;
             }
             SvItem::Instance(instance) => {
                 if !defined.contains(&instance.module)
@@ -1584,14 +1584,182 @@ fn fresh_sv_inst_wire_name(
     }
 }
 
-fn always_ff_signal_targets(items: &[SvItem]) -> HashSet<String> {
-    let mut targets = HashSet::new();
+/// The variables an always_ff makes into CLOCKED REGISTERS. A `<=` (non-blocking)
+/// target is always a register. A `=` (blocking) target is a register only if it
+/// is READ BEFORE it is WRITTEN in the block (so it carries state, e.g.
+/// `count = count + 1`); a blocking temp that is written before any read (e.g.
+/// crc32's `c = crc; … ; crc <= c;`) is combinational — Verilog `reg` is just a
+/// variable, and blocking assignments forward-substitute into later reads.
+fn always_ff_register_targets(items: &[SvItem]) -> HashSet<String> {
+    let mut regs = HashSet::new();
     for item in items {
         if let SvItem::AlwaysFf(always) = item {
-            collect_stmt_signal_targets(&always.body, &mut targets);
+            let mut blocking = HashSet::new();
+            collect_blocking_names(&always.body, &mut blocking);
+            let mut written = HashSet::new();
+            walk_register_targets(&always.body, &blocking, &mut written, &mut regs);
         }
     }
-    targets
+    regs
+}
+
+fn lvalue_name(lv: &SvLvalue) -> String {
+    match lv {
+        SvLvalue::Signal(n)
+        | SvLvalue::Bit { name: n, .. }
+        | SvLvalue::Slice { name: n, .. }
+        | SvLvalue::Memory { name: n, .. }
+        | SvLvalue::Memory2D { name: n, .. } => n.clone(),
+    }
+}
+
+fn lvalue_index_reads(lv: &SvLvalue, out: &mut HashSet<String>) {
+    match lv {
+        SvLvalue::Bit { index, .. } => expr_reads(index, out),
+        SvLvalue::Slice { msb, lsb, .. } => {
+            expr_reads(msb, out);
+            expr_reads(lsb, out);
+        }
+        SvLvalue::Memory { addr, .. } => expr_reads(addr, out),
+        SvLvalue::Memory2D { outer, inner, .. } => {
+            expr_reads(outer, out);
+            expr_reads(inner, out);
+        }
+        SvLvalue::Signal(_) => {}
+    }
+}
+
+fn expr_reads(e: &SvExpr, out: &mut HashSet<String>) {
+    match e {
+        SvExpr::Ident(n) => {
+            out.insert(n.clone());
+        }
+        SvExpr::Lit { .. } => {}
+        SvExpr::Unary { expr, .. }
+        | SvExpr::Cast { expr, .. }
+        | SvExpr::Repeat { expr, .. }
+        | SvExpr::Index { expr, .. }
+        | SvExpr::Slice { expr, .. } => expr_reads(expr, out),
+        SvExpr::Binary { lhs, rhs, .. } => {
+            expr_reads(lhs, out);
+            expr_reads(rhs, out);
+        }
+        SvExpr::Ternary { cond, then_expr, else_expr } => {
+            expr_reads(cond, out);
+            expr_reads(then_expr, out);
+            expr_reads(else_expr, out);
+        }
+        SvExpr::Concat(parts) => parts.iter().for_each(|p| expr_reads(p, out)),
+        SvExpr::MemRead { name, addr } => {
+            out.insert(name.clone());
+            expr_reads(addr, out);
+        }
+        SvExpr::Bracket { expr, index } => {
+            expr_reads(expr, out);
+            expr_reads(index, out);
+        }
+        SvExpr::Call { args, .. } => args.iter().for_each(|a| expr_reads(a, out)),
+    }
+}
+
+fn collect_blocking_names(stmts: &[SvStmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            SvStmt::Assign { dst, nonblocking: false, .. } => {
+                out.insert(lvalue_name(dst));
+            }
+            SvStmt::ConcatAssign { parts, nonblocking: false, .. } => {
+                for p in parts {
+                    out.insert(lvalue_name(p));
+                }
+            }
+            SvStmt::If { then_stmts, else_stmts, .. } => {
+                collect_blocking_names(then_stmts, out);
+                collect_blocking_names(else_stmts, out);
+            }
+            SvStmt::For { body, .. } => collect_blocking_names(body, out),
+            SvStmt::Case { items, .. } => {
+                for it in items {
+                    collect_blocking_names(&it.stmts, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk in execution order. A read of a blocking var not yet written this block
+/// marks it a register; `<=` targets are registers; `=` targets record a write.
+/// Conditional branches (if/case) use a branch-local write set (a var written in
+/// only one branch is not treated as unconditionally written).
+fn walk_register_targets(
+    stmts: &[SvStmt],
+    blocking: &HashSet<String>,
+    written: &mut HashSet<String>,
+    regs: &mut HashSet<String>,
+) {
+    let mark_reads = |reads: &HashSet<String>, written: &HashSet<String>, regs: &mut HashSet<String>| {
+        for n in reads {
+            if blocking.contains(n) && !written.contains(n) {
+                regs.insert(n.clone());
+            }
+        }
+    };
+    for stmt in stmts {
+        match stmt {
+            SvStmt::Assign { dst, nonblocking, expr } => {
+                let mut reads = HashSet::new();
+                expr_reads(expr, &mut reads);
+                lvalue_index_reads(dst, &mut reads);
+                mark_reads(&reads, written, regs);
+                let name = lvalue_name(dst);
+                if *nonblocking {
+                    regs.insert(name);
+                } else {
+                    written.insert(name);
+                }
+            }
+            SvStmt::ConcatAssign { parts, nonblocking, expr } => {
+                let mut reads = HashSet::new();
+                expr_reads(expr, &mut reads);
+                for p in parts {
+                    lvalue_index_reads(p, &mut reads);
+                }
+                mark_reads(&reads, written, regs);
+                for p in parts {
+                    let name = lvalue_name(p);
+                    if *nonblocking {
+                        regs.insert(name);
+                    } else {
+                        written.insert(name);
+                    }
+                }
+            }
+            SvStmt::If { cond, then_stmts, else_stmts } => {
+                let mut reads = HashSet::new();
+                expr_reads(cond, &mut reads);
+                mark_reads(&reads, written, regs);
+                let mut wt = written.clone();
+                walk_register_targets(then_stmts, blocking, &mut wt, regs);
+                let mut we = written.clone();
+                walk_register_targets(else_stmts, blocking, &mut we, regs);
+            }
+            SvStmt::For { body, .. } => {
+                // bounded loop: unrolls, so body writes persist into `written`.
+                walk_register_targets(body, blocking, written, regs);
+            }
+            SvStmt::Case { expr, items, .. } => {
+                let mut reads = HashSet::new();
+                expr_reads(expr, &mut reads);
+                mark_reads(&reads, written, regs);
+                for it in items {
+                    let mut wi = written.clone();
+                    walk_register_targets(&it.stmts, blocking, &mut wi, regs);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn module_signal_names(items: &[SvItem]) -> HashSet<String> {
@@ -2571,6 +2739,7 @@ fn lower_always_ff(
     always: &SvAlwaysFf,
     symbols: &Symbols,
     consts: &HashMap<String, u128>,
+    ff_targets: &HashSet<String>,
     builder: &mut rrtl_core::ModuleBuilder<'_>,
 ) -> Result<(), ErrorReport> {
     let clock = symbols
@@ -2602,8 +2771,15 @@ fn lower_always_ff(
             .get(name)
             .cloned()
             .ok_or_else(|| err("E_SV_ALWAYS_FF", format!("missing next value for `{name}`")))?;
-        builder.clock(reg, clock);
-        builder.next(reg, coerce_expr_to_signal_type(expr, reg, symbols)?);
+        if ff_targets.contains(name) {
+            builder.clock(reg, clock);
+            builder.next(reg, coerce_expr_to_signal_type(expr, reg, symbols)?);
+        } else {
+            // A blocking temp (write-before-read `reg` variable) is combinational:
+            // drive it with its final blocking value (usually dead after the reads
+            // it fed were forward-substituted, but kept for observability).
+            builder.assign(reg, coerce_expr_to_signal_type(expr, reg, symbols)?);
+        }
     }
     Ok(())
 }

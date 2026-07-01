@@ -15,10 +15,10 @@ fn main() {
     let gc = rrtl_core::compile(&gates).unwrap();
     let gh = |n: &str| gc.find_module("crc32").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
 
-    // Reference: crc32.sv's exact 1-cycle recurrence (Yosys keeps the blocking
-    // temp `c` combinational, so the netlist is a 1-cycle CRC — RRTL's frontend
-    // instead registers `c`, giving a 2-cycle pipeline, so we compare against the
-    // algorithm directly rather than the RRTL-behavioral build).
+    // Reference: crc32.sv's exact 1-cycle recurrence. (RRTL's frontend now also
+    // treats the blocking temp `c` as combinational — matching Yosys — so the
+    // behavioral build is 1-cycle too; we still validate against the algorithm as
+    // an independent oracle.)
     fn crc_step(mut c: u32, din: u32) -> u32 {
         for i in 0..8 {
             let bit = ((c >> 31) & 1) ^ ((din >> i) & 1);
