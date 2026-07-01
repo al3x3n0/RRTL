@@ -1900,6 +1900,50 @@ batch composable: N CPUs exploring a 4 GiB space cost N × (touched pages), not 
 page, some heap per instance. (The same structure extends to designs with large on-chip RAMs whose access is
 sparse; the host-bus path is just the most common place it's *required* rather than merely nice.)
 
+## 4l. Symbolic execution: the simulator as a formal engine
+
+Every engine so far advances *concrete* values. Swap each 1-bit signal's concrete value for a **reduced ordered
+binary decision diagram** (ROBDD) — a canonical boolean function of symbolic input variables — and the very
+same gate schedule becomes a *symbolic* execution: run the packed streams with the gate ops (And/Or/Xor/Not/Mux)
+mapped 1:1 onto BDD `apply`, and each output signal ends up as *the boolean function it computes over the
+symbolic inputs*. `symbolic.rs` is the bit-parallel engine (§4g.4b) with one BDD per signal instead of
+`ceil(L/64)` u64 lanes, plus a small hash-consed BDD manager (ite / and / or / xor / not, `sat_one`, `size`) —
+no external SAT/SMT/BDD dependency. It is the same ~250-line engine shape, reused for a different semiring.
+
+This turns the simulator into a lightweight formal tool. Validation first: symbolic-executing the synthesized
+**crc32 netlist** for one cycle with the 8 `din` bits as variables yields 32 output BDDs totalling **196 nodes**,
+and they agree with a concrete run on **all 256** input assignments — an *exhaustive* equivalence proof, not a
+sampled one (`examples/symbolic_exec.rs`, Act 1). The BDDs stay small because crc is GF(2)-linear (parity
+functions have linear BDD size), the same structure §4i–§4i.6 exploited for the tensor-core and temporal-leap
+paths.
+
+The payoff is **ATPG** (automatic test-pattern generation), which closes the loop with the fault-sim work
+(§4g.15). A stuck-at fault's *detection function* is `OR_o(golden_o XOR faulty_o)`, built by snapshotting the
+golden output BDDs, injecting the fault (`set_force_const`, the symbolic sibling of the batch engine's stuck-at
+clamp), and re-settling — both live in one BDD manager, so the XOR is valid. Then:
+
+* a **satisfying assignment** (`sat_one`) *is* a test vector; and
+* the **false BDD** is a *proof the fault is untestable* — a redundancy, a negative that simulation can only ever
+  fail to disprove, never establish.
+
+On a reconvergent-fanout cone `y = (a&b) | (a&~b)` (which is just `a`, so the `~b` path is redundant), the engine
+reports the `nb` wire stuck-at-1 as **provably untestable** (detection BDD = false) while generating concrete
+test vectors for the testable faults (`nb` s-a-0 → `a=1,b=0`; `w` s-a-0 → `a=1,b=1`; `v` s-a-1 → `a=0`) — Act 2.
+And Act 3 unifies the two halves: symbolically generate a test for a real crc32 register fault (`crc_5`
+stuck-at-0 → `din=0x01`, initial state `0`), then *confirm it on the concrete bit-parallel engine* — golden
+`0x690ce0ee` vs faulty `0x690ce0ce`, detected. Symbolic **generates** the test; the batch moat **grades** it (and
+thousands more) — the two engines share the same packed IR and the same stuck-at clamp semantics, which is what
+lets a test cross from one to the other.
+
+Reconciling those semantics surfaced a real refinement: a forced *output that aliases a register* is a
+combinational-wire fault, so the batch engine's clamp — previously applied only after register commit — now also
+re-applies after a comb store in `settle`, matching the symbolic engine. Register-only fault campaigns
+(crc32 100%, picorv32) are unchanged (registers aren't comb-stored), but comb-wire faults now propagate
+identically in both engines. Forcing a *primary input* is deliberately not modeled as a fault (it is just
+constraining that input). The method is exponential in the worst case — BDDs are — so it targets bounded cones
+(a few cycles, a partition, a linear block), the complement to the concrete engines' unbounded-but-per-point
+reach; the two compose (symbolically find the input that excites a corner, concretely run the fleet from there).
+
 ## 5. Single-design latency: register-cone partitioning
 
 For the *other* axis (one massive design, billions of cycles), RRTL has a RepCut-style

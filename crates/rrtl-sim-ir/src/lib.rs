@@ -15,6 +15,7 @@ use rrtl_ir::{
 use serde::{Deserialize, Serialize};
 
 pub mod bitparallel;
+pub mod symbolic;
 pub mod bitslice;
 pub mod policy;
 pub mod specialize;

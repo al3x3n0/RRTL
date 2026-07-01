@@ -100,14 +100,28 @@ impl BitParallelSimulator {
         self.forces.clear();
     }
     fn apply_forces(&mut self) {
-        for &(sig, lane, value) in &self.forces {
-            let (w, b) = (lane / 64, lane % 64);
-            let slot = sig * self.words + w;
-            if value {
-                self.state[slot] |= 1u64 << b;
-            } else {
-                self.state[slot] &= !(1u64 << b);
+        for i in 0..self.forces.len() {
+            let (sig, lane, value) = self.forces[i];
+            self.set_force_bit(sig, lane, value);
+        }
+    }
+    /// Re-apply every force targeting `sig` (called after `sig` is (re)computed).
+    fn clamp_signal(&mut self, sig: usize) {
+        for i in 0..self.forces.len() {
+            let (fs, lane, value) = self.forces[i];
+            if fs == sig {
+                self.set_force_bit(fs, lane, value);
             }
+        }
+    }
+    #[inline]
+    fn set_force_bit(&mut self, sig: usize, lane: usize, value: bool) {
+        let (w, b) = (lane / 64, lane % 64);
+        let slot = sig * self.words + w;
+        if value {
+            self.state[slot] |= 1u64 << b;
+        } else {
+            self.state[slot] &= !(1u64 << b);
         }
     }
 
@@ -240,10 +254,10 @@ impl BitParallelSimulator {
 
     /// Run combinational settle (async-reset-comb then comb), storing comb signals.
     fn settle(&mut self) {
-        for blk in [&self.machine.streams.async_reset_comb, &self.machine.streams.comb] {
-            let nvals = Self::nvals(blk);
+        let blocks = [self.machine.streams.async_reset_comb.clone(), self.machine.streams.comb.clone()];
+        for block in blocks {
+            let nvals = Self::nvals(&block);
             let mut work = vec![0u64; nvals * self.words];
-            let block = blk.clone();
             // Evaluate each packet then apply ITS stores before the next packet, so
             // a later packet's `Signal(wire)` sees the wire its predecessor stored
             // (multi-level comb-wire chains, e.g. from a gate netlist). Packets are
@@ -255,6 +269,12 @@ impl BitParallelSimulator {
                         PackedEffect::StoreSignal { dst, value } => {
                             let (d, v) = (dst * self.words, value.0 * self.words);
                             self.state[d..d + self.words].copy_from_slice(&work[v..v + self.words]);
+                            // Re-clamp a stuck-at fault on this comb wire so it
+                            // propagates instead of being recomputed away (a forced
+                            // output that aliases a register is a comb-wire fault).
+                            if !self.forces.is_empty() {
+                                self.clamp_signal(*dst);
+                            }
                         }
                         PackedEffect::CaptureReg { dst, value, reset } => {
                             // async-reset-comb: immediate conditional store.
@@ -266,6 +286,9 @@ impl BitParallelSimulator {
                                 let d = dst * self.words;
                                 for k in 0..self.words {
                                     self.state[d + k] = (asserted[k] & rv) | (!asserted[k] & work[v + k]);
+                                }
+                                if !self.forces.is_empty() {
+                                    self.clamp_signal(*dst);
                                 }
                             }
                         }
