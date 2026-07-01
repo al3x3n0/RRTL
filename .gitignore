@@ -9,3 +9,4 @@ obj_dir_b/
 obj_aimac/
 *.o
 *.d
+bench/sv/picorv32_gates.json

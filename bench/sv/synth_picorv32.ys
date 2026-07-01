@@ -1,0 +1,7 @@
+read_verilog bench/sv/picorv32.v
+synth -top picorv32 -flatten
+memory_map
+dfflegalize -cell $_DFF_P_ 0
+abc -g AND,OR,XOR,MUX
+opt_clean
+write_json bench/sv/picorv32_gates.json
