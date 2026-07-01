@@ -37,6 +37,9 @@ pub struct BitParallelSimulator {
     /// `num_signals * words` — signal `s` lane-words at `[s*words ..]`.
     state: Vec<u64>,
     num_signals: usize,
+    /// Stuck-at forces `(signal, lane, value)` re-applied after each commit so the
+    /// clamped value propagates through the settle — for per-lane fault injection.
+    forces: Vec<(usize, usize, bool)>,
 }
 
 impl BitParallelSimulator {
@@ -84,7 +87,28 @@ impl BitParallelSimulator {
             words,
             state: vec![0u64; num_signals * words],
             num_signals,
+            forces: Vec::new(),
         })
+    }
+
+    /// Inject a stuck-at fault: clamp `signal` in `lane` to `value` every cycle
+    /// (re-applied after commit so it propagates through the combinational logic).
+    pub fn set_force(&mut self, signal: usize, lane: usize, value: bool) {
+        self.forces.push((signal, lane, value));
+    }
+    pub fn clear_forces(&mut self) {
+        self.forces.clear();
+    }
+    fn apply_forces(&mut self) {
+        for &(sig, lane, value) in &self.forces {
+            let (w, b) = (lane / 64, lane % 64);
+            let slot = sig * self.words + w;
+            if value {
+                self.state[slot] |= 1u64 << b;
+            } else {
+                self.state[slot] &= !(1u64 << b);
+            }
+        }
     }
 
     fn streams(machine: &PackedMachineProgram) -> [&PackedBlock; 4] {
@@ -282,6 +306,9 @@ impl BitParallelSimulator {
             let d = dst * self.words;
             self.state[d..d + self.words].copy_from_slice(&nv);
         }
+        // Re-clamp stuck-at faults over the freshly-committed registers, then let
+        // the settle propagate them into the observable outputs.
+        self.apply_forces();
         self.settle();
     }
 
@@ -523,6 +550,58 @@ mod tests {
                 assert_eq!(bp.get_signal(program.signal_index(h("o")).unwrap(), l), cv[l] & 1 == 1, "o@lane{l} cyc{cyc}");
             }
         }
+    }
+
+    // A stuck-at fault forced on a register must (a) clamp that register's
+    // observable output every cycle and (b) leave an un-forced lane bit-exact vs
+    // a control sim — the fault-injection primitive behind per-lane fault-sim.
+    #[test]
+    fn bitparallel_stuck_at_force_clamps_and_isolates_lanes() {
+        let mut design = Design::new();
+        {
+            let mut m = design.module("Chain");
+            let clk = m.input("clk", uint(1));
+            let a = m.input("a", uint(1));
+            let b = m.input("b", uint(1));
+            let q = m.reg("q", uint(1));
+            let w1 = m.wire("w1", uint(1));
+            let w2 = m.wire("w2", uint(1));
+            m.clock(q, clk);
+            m.assign(w1, a.value() & b.value());
+            m.assign(w2, w1.value() ^ q.value());
+            m.next(q, w2.value());
+            let o = m.output("o", uint(1));
+            m.assign(o, q.value());
+        }
+        let compiled = compile(&design).unwrap();
+        let program = lower_to_packed_program(&compiled, "Chain").unwrap();
+        let machine = lower_to_machine_program(&program);
+        let h = |n: &str| compiled.find_module("Chain").unwrap().signals.iter().find(|s| s.name == n).unwrap().handle;
+        let idx = |n: &str| program.signal_index(h(n)).unwrap();
+        let lanes = 3;
+        let mut bp = BitParallelSimulator::new(&machine, lanes).unwrap();
+        let mut control = BitParallelSimulator::new(&machine, lanes).unwrap();
+        // lane 1: q stuck-at-1; lane 2: q stuck-at-0; lane 0: golden.
+        bp.set_force(idx("q"), 1, true);
+        bp.set_force(idx("q"), 2, false);
+        for l in 0..lanes {
+            for sim in [&mut bp, &mut control] {
+                sim.set_signal(idx("clk"), l, true);
+                sim.set_signal(idx("a"), l, true);
+                sim.set_signal(idx("b"), l, true);
+            }
+        }
+        for cyc in 0..12 {
+            bp.tick();
+            control.tick();
+            // Forced lanes are clamped at the observable output.
+            assert!(bp.get_signal(idx("o"), 1), "stuck-at-1 not clamped @cyc{cyc}");
+            assert!(!bp.get_signal(idx("o"), 2), "stuck-at-0 not clamped @cyc{cyc}");
+            // The un-forced lane matches the control (fault isolation between lanes).
+            assert_eq!(bp.get_signal(idx("o"), 0), control.get_signal(idx("o"), 0), "golden lane diverged @cyc{cyc}");
+        }
+        // With q held at 1 the fault must eventually diverge from the golden lane.
+        assert_ne!(bp.get_signal(idx("o"), 1), bp.get_signal(idx("o"), 0));
     }
 
     // A small gate-level netlist (all 1-bit, NAND/NOR/XNOR) must match the SIMD

@@ -1386,6 +1386,44 @@ M3's P+E cores — so the per-core rate drops under full load. The *mechanism* (
 straggler) is what's being shown; the absolute multiplier is bounded by frequency scaling and core
 heterogeneity, as every multi-core number on this laptop is.
 
+### 4g.15 Fault simulation: the batch moat's killer application
+
+Everything from §4g.13 on argues that the batch axis — *many independent instances in the lanes of one engine*
+— is where a data-parallel simulator dominates. **Fault simulation** is the canonical industrial workload with
+exactly that shape, and it makes the argument concrete. Given a gate netlist and a stimulus, a *stuck-at* fault
+sim asks: for each of the ~2·(#nets) faults (each net pinned to 0 or to 1), does the fault ever change an
+observable output versus the fault-free "golden" circuit? The ratio detected/total is **fault coverage**, the
+number an ATPG flow optimizes. It is embarrassingly the batch regime: one design, one stimulus, N faults — put
+the golden circuit in lane 0 and one fault per remaining lane, and a P-lane engine grades P faults for the cost
+of a single fault-free simulation.
+
+The one primitive the engine needs beyond §4g.13 is **fault injection**: a stuck-at is a net *clamped* to a
+constant every cycle, and the clamp must *propagate* through the downstream cone — not merely overwrite the
+stored value, which the next settle would recompute away. We add `set_force(signal, lane, value)` to the
+bit-parallel engine (`bitparallel.rs`): after each `commit`, forced nets are re-clamped over the freshly-
+committed register values, and *then* the settle runs, so the stuck value reaches the outputs and the next
+cycle's logic. It is per-lane, so distinct faults coexist in one word; lane 0 carries no force and stays golden.
+
+On the real synthesized `crc32` netlist (§4g.4b's import path — 195 cells, 32 flops) `examples/fault_sim.rs`
+injects both stuck-at polarities on every flop (64 faults), one per lane, alongside the golden lane, and runs a
+single 65-lane batch:
+
+| check | result |
+|---|---|
+| golden lane vs fault-free scalar sim | **bit-exact** (96 cycles) |
+| fault coverage | **64 / 64 = 100%** in one 65-lane sweep |
+| detection latency (cycles to first divergence) | min 1, max 6, mean 2.1 |
+
+100% is the *correct* answer here — every flop is a scrambled, fully-observed CRC output, and the LFSR excites
+every bit — but the number is not the point. The **latency spread (1–6 cycles)** is: it shows faults
+propagating through combinational cones of *different depths* before surfacing at an output, i.e. this is a
+genuine time-domain fault simulation, not a one-cycle output mask. The mechanism is validated structurally
+(a unit test forces a register stuck-at-0/1 on separate lanes and asserts the clamp holds at the output, an
+un-forced lane stays bit-exact vs a control sim, and the fault eventually diverges — `bitparallel.rs` tests),
+so the deliverable is correctness, not a throttle-sensitive throughput claim. The throughput *argument* is
+§4g.4b's unchanged: 64 lanes ride in one u64, so the P-fault sweep costs one fault-free simulation's work —
+which is exactly why serial fault simulators are slow and why the batch moat is the right tool for the job.
+
 ## 4h. Measured against Verilator and PyRTL
 
 The JIT claims are only meaningful against the reference tools. We benchmark RRTL vs
